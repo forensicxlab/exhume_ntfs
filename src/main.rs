@@ -2,10 +2,8 @@ use clap::{Arg, ArgAction, Command, value_parser};
 use clap_num::maybe_hex;
 use exhume_body::{Body, BodySlice};
 use exhume_ntfs::NTFS;
-use log::{debug, error, info};
+use log::{debug, error};
 use serde_json::{Value, json};
-use std::fs::File;
-use std::io::Write;
 
 fn main() {
     let matches = Command::new("exhume_ntfs")
@@ -51,6 +49,25 @@ fn main() {
                 .help("Display the partition boot sector information."),
         )
         .arg(
+            Arg::new("file_id")
+                .long("file")
+                .value_parser(maybe_hex::<usize>)
+                .help("Display the metadata about a specific file identifier."),
+        )
+        .arg(
+            Arg::new("dir_entry")
+                .short('d')
+                .long("dir_entry")
+                .action(ArgAction::SetTrue)
+                .help("If --file is specified and it is a directory, list its directory entries."),
+        )
+        .arg(
+            Arg::new("mft")
+                .long("mft")
+                .action(ArgAction::SetTrue)
+                .help("Display the partition boot sector information."),
+        )
+        .arg(
             Arg::new("json")
                 .short('j')
                 .long("json")
@@ -86,6 +103,8 @@ fn main() {
     let size = matches.get_one::<u64>("size").unwrap();
     let show_pbs = matches.get_flag("pbs");
     let json_output = matches.get_flag("json");
+    let file_id = matches.get_one::<usize>("file_id").copied().unwrap_or(0);
+    let show_dir_entry = matches.get_flag("dir_entry");
 
     // 1) Prepare the "body" and create an ExtFS instance.
     let mut body = Body::new(file_path.to_owned(), format);
@@ -103,7 +122,7 @@ fn main() {
     let mut filesystem = match NTFS::new(&mut slice) {
         Ok(fs) => fs,
         Err(e) => {
-            error!("Couldn't open ExtFS: {}", e);
+            error!("Couldn't open NTFS: {}", e);
             return;
         }
     };
@@ -112,10 +131,36 @@ fn main() {
         if json_output {
             match serde_json::to_string_pretty(&filesystem.pbs.to_json()) {
                 Ok(s) => println!("{}", s),
-                Err(e) => error!("Error serializing superblock to JSON: {}", e),
+                Err(e) => error!("Error serializing PBS to JSON: {}", e),
             }
         } else {
             println!("{}", filesystem.pbs.to_string());
+        }
+    }
+
+    if file_id > 0 {
+        let file = filesystem.get_file_id(file_id as u64).unwrap();
+
+        if show_dir_entry {
+            let entries = filesystem
+                .list_dir(file_id as u64)
+                .expect("Could not list directory entries for this record.");
+
+            if json_output {
+                let arr: Vec<Value> = entries.iter().map(|de| de.to_json()).collect();
+                let dir_json = json!({ "dir_entries": arr });
+                println!("{}", serde_json::to_string_pretty(&dir_json).unwrap());
+            } else {
+                for file in entries {
+                    println!("{}  {}", file.file_id, file.name);
+                }
+            }
+        } else {
+            if json_output {
+                println!("{}", file.to_json())
+            } else {
+                println!("{}", file.to_string());
+            }
         }
     }
 }

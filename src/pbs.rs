@@ -21,7 +21,7 @@ pub struct PartitionBootSector {
     pub reserved_sectors: u16,   // 0x0E
     pub unused1: [u8; 3],        // 0x10
     pub unused2: u16,            // 0x13
-    pub media_descriptor: u8,    // 0x15 (0xF8 = hard disk)
+    pub media_descriptor: u8,    // 0x15
     pub unused3: u16,            // 0x16
     pub sectors_per_track: u16,  // 0x18
     pub number_of_heads: u16,    // 0x1A
@@ -33,7 +33,7 @@ pub struct PartitionBootSector {
     pub total_sectors: u64,           // 0x28
     pub mft_cluster: u64,             // 0x30
     pub mft_mirror_cluster: u64,      // 0x38
-    pub clusters_per_file_record: i8, // 0x40  (may be negative)
+    pub clusters_per_file_record: i8, // 0x40
     pub unused6: [u8; 3],
     pub clusters_per_index_buffer: i8, // 0x44
     pub unused7: [u8; 3],
@@ -58,7 +58,7 @@ impl PartitionBootSector {
         }
         let mut c = Cursor::new(buf);
 
-        /* helper macros to reduce boilerplate */
+        /* classical helper macros */
         macro_rules! read_array {
             ($len:expr) => {{
                 let mut tmp = [0u8; $len];
@@ -136,11 +136,27 @@ impl PartitionBootSector {
         }
     }
 
+    /// Get the size of one cluster
+    pub fn cluster_size(&self) -> u32 {
+        self.sectors_per_cluster as u32 * self.bytes_per_sector as u32
+    }
+
+    /// Get the logical byte address of the MFT
+    pub fn mft_address(&self) -> u64 {
+        self.mft_cluster * self.cluster_size() as u64
+    }
+
+    /// Get the logical byte address of the MFT mirror
+    pub fn mft_backup(&self) -> u64 {
+        self.mft_mirror_cluster * self.cluster_size() as u64
+    }
+
     pub fn to_json(&self) -> Value {
         serde_json::to_value(self).unwrap_or_else(|_| json!({}))
     }
 
     pub fn to_string(&self) -> String {
-        "to_do".to_string()
+        // I need to do this...Tired
+        format!("MFT address: {:0X}", self.mft_address())
     }
 }
