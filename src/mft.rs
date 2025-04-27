@@ -1,7 +1,14 @@
 // Sources:
 // - https://dubeyko.com/development/FileSystems/NTFS/ntfsdoc.pdf
 // - https://en.wikipedia.org/wiki/NTFS
-
+// TODO: include more logs and error handling.
+// TODO: Some attributes are missing parsing:
+//  - Multiple FILE_NAME Attributes.
+//  - ALTERNATE DATA STREAMS.
+//  - Parent file id ?
+//  - Last User Journal Update Sequence Number ?
+//  - SID parsing.
+//  - StandardInformation file flags.
 use byteorder::{LittleEndian, ReadBytesExt};
 use chrono::{TimeZone, Utc};
 use core::convert::TryFrom;
@@ -84,6 +91,7 @@ pub struct MftRecord {
 }
 
 impl MftRecord {
+    /// Create a new MFT record object from a buffer of data
     pub fn from_bytes(mut buf: &[u8]) -> Result<Self, String> {
         let mut cursor = Cursor::new(&mut buf);
         let header = match parse_header(&mut cursor) {
@@ -118,6 +126,7 @@ impl MftRecord {
         Ok(MftRecord { header, attributes })
     }
 
+    /// Fetch the Directory Entries of and MFT Record
     pub fn directory_entries(&self) -> Option<Vec<DirectoryEntry>> {
         // Flag 0x0002 = “this record describes a directory”
         if self.header.flags & 0x0002 == 0 {
@@ -137,6 +146,7 @@ impl MftRecord {
         parse_index_root(root_attr)
     }
 
+    /// Fetch the size of an index record
     pub fn index_record_size(&self, default: u32) -> u32 {
         if let Some(root) = self.attributes.iter().find_map(|a| {
             if let Attribute::Resident { value, header, .. } = a {
@@ -161,7 +171,6 @@ impl MftRecord {
 
     pub fn to_string(&self) -> String {
         let mut out = String::new();
-
         let mut hdr = Table::new();
         hdr.add_row(row!["MFT Entry Header Values"]);
         hdr.add_row(row![b -> "Sequence",  self.header.sequence_number]);
@@ -268,10 +277,15 @@ impl MftRecord {
     }
 }
 
+/// Parse a FILE record header
 fn parse_header<R: Read + Seek>(cursor: &mut R) -> Result<FileRecordHeader, String> {
     let mut signature = [0u8; 4];
     cursor.read_exact(&mut signature).unwrap();
     if &signature != b"FILE" {
+        error!(
+            "Record signature is not 'FILE', found: {}",
+            String::from_utf8_lossy(&signature)
+        );
         return Err("record signature is not 'FILE'".to_string());
     }
     let usa_offset = cursor.read_u16::<LittleEndian>().unwrap();
@@ -305,6 +319,7 @@ fn parse_header<R: Read + Seek>(cursor: &mut R) -> Result<FileRecordHeader, Stri
     })
 }
 
+/// Parse any MFT Attribute
 fn parse_attribute<R: Read + Seek>(
     cursor: &mut R,
     attr_type: AttributeType,
@@ -464,11 +479,9 @@ impl TryFrom<u32> for AttributeType {
     }
 }
 
-/// Windows FILETIME → `chrono` local date-time
+/// Windows FILETIME → RFC3339
 fn filetime_to_local_datetime(ft: u64) -> String {
-    // 100-ns ticks since 1601-01-01 → µs since 1601
     let micros_since_1601 = ft / 10;
-    // µs between 1601-01-01 and 1970-01-01
     const DELTA_MICROS: i64 = 116_444_736_000_000_00;
     let unix_micros = micros_since_1601 as i64 - DELTA_MICROS;
     let secs = unix_micros / 1_000_000;
