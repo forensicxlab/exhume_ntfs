@@ -58,6 +58,7 @@ fn main() {
             Arg::new("dir_entry")
                 .short('d')
                 .long("dir_entry")
+                .requires("file_id")
                 .action(ArgAction::SetTrue)
                 .help("If --file is specified and it is a directory, list its directory entries."),
         )
@@ -66,6 +67,13 @@ fn main() {
                 .long("mft")
                 .action(ArgAction::SetTrue)
                 .help("Display the partition boot sector information."),
+        )
+        .arg(
+            Arg::new("dump")
+                .long("dump")
+                .action(ArgAction::SetTrue)
+                .requires("file_id")
+                .help("Dump the file content to file_<ID>.bin (requires --file)"),
         )
         .arg(
             Arg::new("json")
@@ -102,6 +110,7 @@ fn main() {
     let offset = matches.get_one::<u64>("offset").unwrap();
     let size = matches.get_one::<u64>("size").unwrap();
     let show_pbs = matches.get_flag("pbs");
+    let dump_file = matches.get_flag("dump");
     let json_output = matches.get_flag("json");
     let file_id = matches.get_one::<usize>("file_id").copied().unwrap_or(0);
     let show_dir_entry = matches.get_flag("dir_entry");
@@ -153,6 +162,23 @@ fn main() {
             } else {
                 for file in entries {
                     println!("{}  {}", file.file_id, file.name);
+                }
+            }
+        } else if dump_file {
+            // ─────────────────────  New “dump” branch  ────────────────────────
+            if file.header.flags & 0x0002 != 0 {
+                error!("Record {} is a directory – refusing to dump.", file_id);
+            } else {
+                match filesystem.read_file(&file) {
+                    Ok(data) => {
+                        let out_name = format!("file_{:X}.bin", file_id);
+                        if let Err(e) = std::fs::write(&out_name, &data) {
+                            error!("Cannot write dump: {}", e);
+                        } else {
+                            println!("Dumped {} bytes to {}", data.len(), out_name);
+                        }
+                    }
+                    Err(e) => error!("Dump failed: {}", e),
                 }
             }
         } else {

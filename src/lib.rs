@@ -7,8 +7,8 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::io::{Read, Seek, SeekFrom};
 
-use log::{debug, info};
-use mft::{DirectoryEntry, MftRecord};
+use log::{debug, error, info};
+use mft::{Attribute, AttributeType, DirectoryEntry, MftRecord};
 use pbs::PartitionBootSector;
 
 pub mod mft;
@@ -33,15 +33,18 @@ impl<T: Read + Seek> NTFS<T> {
                 mft_runs: None,
             })
         } else {
-            Err("The OEM Identifier is not valid".into())
+            error!("The OEM Identifier is not valid.");
+            Err("The OEM Identifier is not valid.".into())
         }
     }
 
     /// Load MFT run-list if not loaded yet
     fn ensure_mft_runs(&mut self) -> Result<(), Box<dyn Error>> {
         if self.mft_runs.is_some() {
+            debug!("Using Cached MFT run-list.");
             return Ok(());
         }
+        debug!("Loading MFT run-list (not loaded).");
 
         // record 0 is always in the first extent
         let off0 = self.pbs.mft_address();
@@ -85,7 +88,7 @@ impl<T: Read + Seek> NTFS<T> {
 
         // Walk the run-list to find the physical LCN for that VCN
         let mut base_vcn = 0u64;
-        let (lcn, run_len) = runs
+        let (lcn, _run_len) = runs
             .iter()
             .find(|(_, len)| {
                 let hit = vcn < base_vcn + *len as u64;
@@ -97,8 +100,8 @@ impl<T: Read + Seek> NTFS<T> {
             .ok_or("VCN out of range for $MFT")?;
 
         let cluster_delta = (vcn - base_vcn) as u64;
-        let phys_off = (*lcn as u64) * clu_size                  +  // start of the right extent
-            cluster_delta   * clu_size                +  // inside that extent
+        let phys_off = (*lcn as u64) * clu_size + // start of the right extent
+            cluster_delta   * clu_size + // inside that extent
             idx_in_clu      * rec_size; // inside the cluster
 
         self.body.seek(SeekFrom::Start(phys_off))?;
@@ -166,7 +169,7 @@ impl<T: Read + Seek> NTFS<T> {
                             continue;
                         }
                     }
-                    // ─ parse INDEX_HEADER inside ─
+                    // parse INDEX_HEADER inside
                     use byteorder::{LittleEndian, ReadBytesExt};
                     let mut cur = std::io::Cursor::new(&buf[0x18..]);
                     let ent_off = cur.read_u32::<LittleEndian>()? as usize;
@@ -196,6 +199,52 @@ impl<T: Read + Seek> NTFS<T> {
         entries.retain(|e| seen.insert((e.file_id, e.name.clone())));
 
         Ok(entries)
+    }
+
+    /// Read the $DATA stream of rec and return its raw bytes.
+    pub fn read_file(&mut self, record: &MftRecord) -> Result<Vec<u8>, Box<dyn Error>> {
+        // Locate the unnamed $DATA attribute
+        let data_attr = record
+            .attributes
+            .iter()
+            .find(|a| match a {
+                Attribute::Resident { header, .. } | Attribute::NonResident { header, .. } => {
+                    header.attr_type == AttributeType::Data && header.name_length == 0
+                }
+            })
+            .ok_or("unnamed $DATA attribute not found")?;
+
+        match data_attr {
+            //  Resident
+            Attribute::Resident { value, .. } => Ok(value.clone()),
+
+            //  Non‑resident
+            Attribute::NonResident {
+                non_resident,
+                run_list,
+                ..
+            } => {
+                let cluster_size = self.pbs.cluster_size() as usize;
+                let mut out = Vec::with_capacity(non_resident.real_size as usize);
+
+                for (lcn, len) in decode_run_list(run_list) {
+                    let byte_len = len as usize * cluster_size;
+
+                    if lcn < 0 {
+                        out.extend(std::iter::repeat(0u8).take(byte_len)); // sparse
+                    } else {
+                        let off = lcn as u64 * cluster_size as u64;
+                        self.body.seek(SeekFrom::Start(off))?;
+                        let mut buf = vec![0u8; byte_len];
+                        self.body.read_exact(&mut buf)?;
+                        out.extend_from_slice(&buf);
+                    }
+                }
+
+                out.truncate(non_resident.real_size as usize);
+                Ok(out)
+            }
+        }
     }
 }
 
