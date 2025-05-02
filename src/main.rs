@@ -80,7 +80,7 @@ fn main() {
                 .short('j')
                 .long("json")
                 .action(ArgAction::SetTrue)
-                .help("Output certain structures (superblock, inode) in JSON format."),
+                .help("Output certain structures (pbs, file, mft) in JSON format."),
         )
         .arg(
             Arg::new("log_level")
