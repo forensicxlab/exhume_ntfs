@@ -6,7 +6,7 @@
 use byteorder::{LittleEndian, ReadBytesExt};
 use chrono::{TimeZone, Utc};
 use core::convert::TryFrom;
-use log::error;
+use log::{debug, error, warn};
 use prettytable::{Table, row};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -93,44 +93,95 @@ pub struct MFTRecord {
     pub attributes: Vec<Attribute>,
 }
 
+// At the end of every 512‑byte sector NTFS overwrites the last two bytes with the Update‑Sequence Number (USN).
+fn apply_fixups(buf: &mut [u8], usa_offset: usize, usa_count: usize) -> Result<(), String> {
+    if usa_offset + 2 * usa_count > buf.len() {
+        warn!("Incomplete multi‑sector transfer – corrupted MFT record.");
+        return Err("USA table outside record".into());
+    }
+    if usa_count < 1 {
+        debug!("MFT record verified (USA check OK).");
+        return Ok(());
+    }
+
+    debug!("Detected a multi-sector record, patching.");
+
+    // Take a copy of the Update‑Sequence Number, not a slice
+    let usn = [buf[usa_offset], buf[usa_offset + 1]];
+
+    for i in 1..usa_count {
+        let sector_end = i * 512 - 2;
+        if sector_end + 2 > buf.len() {
+            return Err(format!("sector {} ends after record", i));
+        }
+
+        // Validate the two bytes at the end of the sector
+        if buf[sector_end] != usn[0] || buf[sector_end + 1] != usn[1] {
+            return Err(format!("bad USN at sector {}", i));
+        }
+
+        // Fetch the real words from the USA and patch them in
+        let fix_pos = usa_offset + 2 * i;
+        let fix0 = buf[fix_pos];
+        let fix1 = buf[fix_pos + 1];
+
+        buf[sector_end] = fix0;
+        buf[sector_end + 1] = fix1;
+    }
+    Ok(())
+}
+
 impl MFTRecord {
     /// Parse a raw 1 KiB record into a `MFTRecord`.
-    pub fn from_bytes(mut buf: &[u8], identifier: Option<u64>) -> Result<Self, String> {
-        let mut cursor = Cursor::new(&mut buf);
-        let header = match parse_header(&mut cursor) {
-            Ok(header) => header,
-            Err(err) => {
-                error!("Could not parse the FILE Header: {:?}", err);
-                return Err(err);
-            }
-        };
+    pub fn from_bytes(raw: &[u8], identifier: Option<u64>) -> Result<Self, String> {
+        // we need a mutable copy so we can patch the USNs in‑place
+        let mut buf = raw.to_vec();
 
-        let file_id = identifier.unwrap_or(0);
+        let mut cursor = Cursor::new(&buf);
+        let header = parse_header(&mut cursor)?;
 
+        apply_fixups(
+            &mut buf,
+            header.usa_offset as usize,
+            header.usa_count as usize,
+        )?;
+
+        cursor = Cursor::new(&buf);
         cursor
-            .seek(SeekFrom::Start(u64::from(header.attrs_offset)))
+            .seek(SeekFrom::Start(header.attrs_offset.into()))
             .unwrap();
 
         let mut attributes = Vec::new();
         loop {
-            let attr_type_num = cursor.read_u32::<LittleEndian>().unwrap();
+            /* stop if fewer than 4 bytes remain */
+            if cursor.position() + 4 > header.bytes_in_use as u64 {
+                break;
+            }
+
+            let attr_type_num = match cursor.read_u32::<LittleEndian>() {
+                Ok(v) => v,
+                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break, // graceful
+                Err(e) => return Err(e.to_string()),
+            };
             if attr_type_num == 0xFFFFFFFF {
                 break;
             }
-            let attr_type = AttributeType::try_from(attr_type_num).unwrap();
+
+            let attr_type = AttributeType::try_from(attr_type_num)?;
             cursor.seek(SeekFrom::Current(-4)).unwrap();
-            let attr = parse_attribute(&mut cursor, attr_type).unwrap();
+            let attr = parse_attribute(&mut cursor, attr_type)?; // propagate errors
             attributes.push(attr);
         }
+
         Ok(MFTRecord {
-            id: file_id,
+            id: identifier.unwrap_or(0),
             header,
             attributes,
         })
     }
 
     /// List every $FILE_NAME attribute found (there may be 2 – long & DOS).
-    fn file_names(&self) -> Vec<FileNameAttr> {
+    pub fn file_names(&self) -> Vec<FileNameAttr> {
         self.attributes
             .iter()
             .filter_map(|a| {
@@ -557,23 +608,23 @@ fn filetime_to_local_datetime(ft: u64) -> String {
 
 /// Parsed $STANDARD_INFORMATION (covers v0 & v1, optionally v2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StandardInformation {
-    created: String,
-    modified: String,
-    mft_modified: String,
-    accessed: String,
-    file_attrs: u32,
-    max_versions: u32,
-    version_number: u32,
-    class_id: u32,
-    owner_id: Option<u32>,
-    security_id: Option<u32>,
-    quota_charged: Option<u64>,
-    usn: Option<u64>,
+pub struct StandardInformation {
+    pub created: String,
+    pub modified: String,
+    pub mft_modified: String,
+    pub accessed: String,
+    pub file_attrs: u32,
+    pub max_versions: u32,
+    pub version_number: u32,
+    pub class_id: u32,
+    pub owner_id: Option<u32>,
+    pub security_id: Option<u32>,
+    pub quota_charged: Option<u64>,
+    pub usn: Option<u64>,
 }
 
 impl StandardInformation {
-    fn from_bytes(raw: &[u8]) -> Option<Self> {
+    pub fn from_bytes(raw: &[u8]) -> Option<Self> {
         if raw.len() < 0x30 {
             return None;
         }
@@ -625,17 +676,17 @@ impl StandardInformation {
 
 /// Parsed $FILE_NAME attribute (first 66 bytes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileNameAttr {
-    parent_ref: u64,
-    parent_seq: u16,
-    allocated_size: u64,
-    real_size: u64,
-    name: String,
-    flags: u32,
-    created: String,
-    modified: String,
-    mft_modified: String,
-    accessed: String,
+pub struct FileNameAttr {
+    pub parent_ref: u64,
+    pub parent_seq: u16,
+    pub allocated_size: u64,
+    pub real_size: u64,
+    pub name: String,
+    pub flags: u32,
+    pub created: String,
+    pub modified: String,
+    pub mft_modified: String,
+    pub accessed: String,
 }
 
 impl FileNameAttr {

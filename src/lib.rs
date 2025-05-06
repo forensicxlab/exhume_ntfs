@@ -120,11 +120,11 @@ impl<T: Read + Seek> NTFS<T> {
         let mut buf = vec![0u8; rec_size as usize];
         self.body.read_exact(&mut buf)?;
 
-        info!("MFT entry {} read from LBA 0x{:X}", file_id, phys_off);
+        debug!("MFT entry {} read from LBA 0x{:X}", file_id, phys_off);
         Ok(MFTRecord::from_bytes(&buf, Some(file_id))?)
     }
 
-    /// List every child entry of the directory whose MFT record is `dir_id`.
+    /// List every child entry of the directory whose MFT record is "dir_id".
     /// Works for both small (resident) and large (non-resident) directories.
     pub fn list_dir(&mut self, dir_id: u64) -> Result<Vec<DirectoryEntry>, Box<dyn Error>> {
         let rec = self.get_file_id(dir_id)?;
