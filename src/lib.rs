@@ -3,17 +3,19 @@
 // - https://en.wikipedia.org/wiki/NTFS
 // TODO: include more logs and error handling.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::error::Error;
 use std::io::{Read, Seek, SeekFrom};
 
 use log::{debug, error, info};
-use mft::{Attribute, AttributeType, DirectoryEntry, MftRecord};
+use mft::{Attribute, AttributeType, DirectoryEntry, MFTRecord};
 use pbs::PartitionBootSector;
 
 pub mod mft;
 pub mod pbs;
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NTFS<T: Read + Seek> {
     pub pbs: PartitionBootSector,
     pub body: T,
@@ -51,7 +53,7 @@ impl<T: Read + Seek> NTFS<T> {
         self.body.seek(SeekFrom::Start(off0))?;
         let mut buf = vec![0u8; self.pbs.file_record_size() as usize];
         self.body.read_exact(&mut buf)?;
-        let rec0 = MftRecord::from_bytes(&buf)?;
+        let rec0 = MFTRecord::from_bytes(&buf, None)?;
 
         /* locate the non-resident DATA attribute of $MFT */
         let run_list_raw = rec0
@@ -73,7 +75,17 @@ impl<T: Read + Seek> NTFS<T> {
         Ok(())
     }
 
-    pub fn get_file_id(&mut self, file_id: u64) -> Result<MftRecord, Box<dyn Error>> {
+    pub fn mft_records_count(&mut self) -> Result<u64, Box<dyn Error>> {
+        self.ensure_mft_runs()?; // make sure we have the run‑list
+        let runs = self.mft_runs.as_ref().unwrap();
+
+        let total_clusters: u64 = runs.iter().map(|(_, len)| *len as u64).sum();
+        let total_bytes = total_clusters * self.pbs.cluster_size() as u64;
+
+        Ok(total_bytes / self.pbs.file_record_size() as u64)
+    }
+
+    pub fn get_file_id(&mut self, file_id: u64) -> Result<MFTRecord, Box<dyn Error>> {
         // Making sure we know where every extent of $MFT lives
         self.ensure_mft_runs()?;
         let runs = self.mft_runs.as_ref().unwrap();
@@ -109,7 +121,7 @@ impl<T: Read + Seek> NTFS<T> {
         self.body.read_exact(&mut buf)?;
 
         info!("MFT entry {} read from LBA 0x{:X}", file_id, phys_off);
-        Ok(MftRecord::from_bytes(&buf)?)
+        Ok(MFTRecord::from_bytes(&buf, Some(file_id))?)
     }
 
     /// List every child entry of the directory whose MFT record is `dir_id`.
@@ -202,7 +214,7 @@ impl<T: Read + Seek> NTFS<T> {
     }
 
     /// Read the $DATA stream of rec and return its raw bytes.
-    pub fn read_file(&mut self, record: &MftRecord) -> Result<Vec<u8>, Box<dyn Error>> {
+    pub fn read_file(&mut self, record: &MFTRecord) -> Result<Vec<u8>, Box<dyn Error>> {
         // Locate the unnamed $DATA attribute
         let data_attr = record
             .attributes

@@ -66,7 +66,7 @@ fn main() {
             Arg::new("mft")
                 .long("mft")
                 .action(ArgAction::SetTrue)
-                .help("Display the partition boot sector information."),
+                .help("Display the high level master file table information."),
         )
         .arg(
             Arg::new("dump")
@@ -165,21 +165,16 @@ fn main() {
                 }
             }
         } else if dump_file {
-            // ─────────────────────  New “dump” branch  ────────────────────────
-            if file.header.flags & 0x0002 != 0 {
-                error!("Record {} is a directory – refusing to dump.", file_id);
-            } else {
-                match filesystem.read_file(&file) {
-                    Ok(data) => {
-                        let out_name = format!("file_{:X}.bin", file_id);
-                        if let Err(e) = std::fs::write(&out_name, &data) {
-                            error!("Cannot write dump: {}", e);
-                        } else {
-                            println!("Dumped {} bytes to {}", data.len(), out_name);
-                        }
+            match filesystem.read_file(&file) {
+                Ok(data) => {
+                    let out_name = format!("file_{:X}.bin", file_id);
+                    if let Err(e) = std::fs::write(&out_name, &data) {
+                        error!("Cannot write dump: {}", e);
+                    } else {
+                        println!("Dumped {} bytes to {}", data.len(), out_name);
                     }
-                    Err(e) => error!("Dump failed: {}", e),
                 }
+                Err(e) => error!("Dump failed: {}", e),
             }
         } else {
             if json_output {

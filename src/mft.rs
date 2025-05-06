@@ -87,14 +87,15 @@ pub struct DataStream {
 
 /// A fully parsed 1 KiB MFT record.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct MftRecord {
+pub struct MFTRecord {
+    pub id: u64,
     pub header: FileRecordHeader,
     pub attributes: Vec<Attribute>,
 }
 
-impl MftRecord {
-    /// Parse a raw 1 KiB record into a `MftRecord`.
-    pub fn from_bytes(mut buf: &[u8]) -> Result<Self, String> {
+impl MFTRecord {
+    /// Parse a raw 1 KiB record into a `MFTRecord`.
+    pub fn from_bytes(mut buf: &[u8], identifier: Option<u64>) -> Result<Self, String> {
         let mut cursor = Cursor::new(&mut buf);
         let header = match parse_header(&mut cursor) {
             Ok(header) => header,
@@ -103,6 +104,8 @@ impl MftRecord {
                 return Err(err);
             }
         };
+
+        let file_id = identifier.unwrap_or(0);
 
         cursor
             .seek(SeekFrom::Start(u64::from(header.attrs_offset)))
@@ -119,7 +122,11 @@ impl MftRecord {
             let attr = parse_attribute(&mut cursor, attr_type).unwrap();
             attributes.push(attr);
         }
-        Ok(MftRecord { header, attributes })
+        Ok(MFTRecord {
+            id: file_id,
+            header,
+            attributes,
+        })
     }
 
     /// List every $FILE_NAME attribute found (there may be 2 – long & DOS).
@@ -178,9 +185,13 @@ impl MftRecord {
             .collect()
     }
 
-    /// Fetch directory entries (works for resident & non‑resident index). See original impl.
+    pub fn is_dir(&self) -> bool {
+        self.header.flags & 0x0002 != 0
+    }
+
+    /// Fetch directory entries (works for resident & non‑resident index)
     pub fn directory_entries(&self) -> Option<Vec<DirectoryEntry>> {
-        if self.header.flags & 0x0002 == 0 {
+        if !self.is_dir() {
             return None;
         }
         let root_attr = self.attributes.iter().find_map(|a| {
