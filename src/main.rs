@@ -7,9 +7,9 @@ use serde_json::{Value, json};
 
 fn main() {
     let matches = Command::new("exhume_ntfs")
-        .version("0.1.O")
+        .version("0.1.3")
         .author("ForensicXlab")
-        .about("Exhume the metadata from an ntfs filesystem.")
+        .about("Exhume the metadata from an Microsoft NTFS filesystem.")
         .arg(
             Arg::new("body")
                 .short('b')
