@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 fn main() {
     let matches = Command::new("exhume_ntfs")
-        .version("0.1.3")
+        .version("0.1.4")
         .author("ForensicXlab")
         .about("Exhume the metadata from an Microsoft NTFS filesystem.")
         .arg(
@@ -63,10 +63,11 @@ fn main() {
                 .help("If --file is specified and it is a directory, list its directory entries."),
         )
         .arg(
-            Arg::new("mft")
-                .long("mft")
+            Arg::new("bootstrap")
+                .long("bootstrap")
+                .requires("pbs")
                 .action(ArgAction::SetTrue)
-                .help("Display the high level master file table information."),
+                .help("Display the dissasembled bootstrap code from the pbs."),
         )
         .arg(
             Arg::new("dump")
@@ -110,6 +111,7 @@ fn main() {
     let offset = matches.get_one::<u64>("offset").unwrap();
     let size = matches.get_one::<u64>("size").unwrap();
     let show_pbs = matches.get_flag("pbs");
+    let show_bootstrap = matches.get_flag("bootstrap");
     let dump_file = matches.get_flag("dump");
     let json_output = matches.get_flag("json");
     let file_id = matches.get_one::<usize>("file_id").copied().unwrap_or(0);
@@ -145,6 +147,10 @@ fn main() {
         } else {
             println!("{}", filesystem.pbs.to_string());
         }
+    }
+
+    if show_bootstrap {
+        println!("{}", filesystem.pbs.disassemble_bootstrap_code());
     }
 
     if file_id > 0 {

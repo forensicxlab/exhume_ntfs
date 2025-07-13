@@ -5,6 +5,8 @@
 //! Cargo.toml →  byteorder = "1.5"
 
 use byteorder::{LittleEndian, ReadBytesExt};
+use capstone::prelude::*;
+use prettytable::{Table, row};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, Cursor, Read};
@@ -156,7 +158,74 @@ impl PartitionBootSector {
     }
 
     pub fn to_string(&self) -> String {
-        // I need to do this...Tired
-        format!("MFT address: {:0X}", self.mft_address())
+        let mut table = Table::new();
+
+        table.add_row(row!["Field", "Value"]);
+        table.add_row(row![
+            "OEM ID",
+            String::from_utf8_lossy(&self.oem_id).trim().to_string()
+        ]);
+        table.add_row(row!["Bytes per sector", self.bytes_per_sector.to_string()]);
+        table.add_row(row![
+            "Sectors per cluster",
+            self.sectors_per_cluster.to_string()
+        ]);
+        table.add_row(row!["Reserved sectors", self.reserved_sectors.to_string()]);
+        table.add_row(row![
+            "Media descriptor",
+            format!("{:02X}", self.media_descriptor)
+        ]);
+        table.add_row(row![
+            "Sectors per track",
+            self.sectors_per_track.to_string()
+        ]);
+        table.add_row(row!["Number of heads", self.number_of_heads.to_string()]);
+        table.add_row(row!["Hidden sectors", self.hidden_sectors.to_string()]);
+        table.add_row(row!["Total sectors", self.total_sectors.to_string()]);
+        table.add_row(row!["MFT cluster", self.mft_cluster.to_string()]);
+        table.add_row(row![
+            "MFT mirror cluster",
+            self.mft_mirror_cluster.to_string()
+        ]);
+        table.add_row(row![
+            "File record size (bytes)",
+            self.file_record_size().to_string()
+        ]);
+        table.add_row(row![
+            "Cluster size (bytes)",
+            self.cluster_size().to_string()
+        ]);
+        table.add_row(row!["MFT address", format!("0x{:X}", self.mft_address())]);
+        table.add_row(row!["MFT backup", format!("0x{:X}", self.mft_backup())]);
+        table.add_row(row![
+            "Volume serial number",
+            format!("0x{:X}", self.volume_serial_number)
+        ]);
+        table.add_row(row![
+            "End of sector marker",
+            format!("{:04X}", self.end_of_sector_marker)
+        ]);
+        table.to_string()
+    }
+
+    pub fn disassemble_bootstrap_code(&self) -> String {
+        let cs = Capstone::new()
+            .x86()
+            .mode(arch::x86::ArchMode::Mode16)
+            .build()
+            .unwrap();
+
+        let insns = cs.disasm_all(&self.bootstrap_code, 0x7C00).unwrap();
+
+        let mut result = String::new();
+        for i in insns.iter() {
+            result.push_str(&format!(
+                "0x{:04X}:\t{}\t{}\n",
+                i.address(),
+                i.mnemonic().unwrap_or(""),
+                i.op_str().unwrap_or("")
+            ));
+        }
+        result
     }
 }
