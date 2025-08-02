@@ -258,6 +258,127 @@ impl<T: Read + Seek> NTFS<T> {
             }
         }
     }
+
+    /// Read `length` bytes from the unnamed $DATA stream of `record`,
+    /// starting at `offset`.  Holes (sparse clusters) are returned as 0x00.
+    pub fn read_file_slice(
+        &mut self,
+        record: &MFTRecord,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
+        // --- Locate the unnamed $DATA attribute ----------------------------
+        let data_attr = record
+            .attributes
+            .iter()
+            .find(|a| match a {
+                Attribute::Resident { header, .. } | Attribute::NonResident { header, .. } => {
+                    header.attr_type == AttributeType::Data && header.name_length == 0
+                }
+            })
+            .ok_or("unnamed $DATA attribute not found")?;
+
+        // --------------------------------------------------------------------
+        // 1. Small, resident file – trivial slice
+        // --------------------------------------------------------------------
+        if let Attribute::Resident { value, .. } = data_attr {
+            if offset >= value.len() as u64 || length == 0 {
+                return Ok(Vec::new());
+            }
+            let start = offset as usize;
+            let end = std::cmp::min(start + length, value.len());
+            return Ok(value[start..end].to_vec());
+        }
+
+        // --------------------------------------------------------------------
+        // 2. Non-resident file – walk the run-list on demand
+        // --------------------------------------------------------------------
+        let Attribute::NonResident {
+            non_resident,
+            run_list,
+            ..
+        } = data_attr
+        else {
+            unreachable!();
+        };
+
+        let file_size = non_resident.real_size;
+        if offset >= file_size || length == 0 {
+            return Ok(Vec::new());
+        }
+
+        let wanted = std::cmp::min(length as u64, file_size - offset) as usize;
+        let mut out = vec![0u8; wanted];
+
+        let cluster_size = self.pbs.cluster_size() as u64;
+        let first_vcn = offset / cluster_size;
+        let last_vcn = (offset + wanted as u64 - 1) / cluster_size;
+
+        // Closure: copy bytes from one full cluster buffer into our slice ----
+        let copy_from_cluster =
+            |dst: &mut [u8], cluster_buf: &[u8], cluster_global_off: u64, req_off: u64| {
+                let rel_start = if req_off > cluster_global_off {
+                    (req_off - cluster_global_off) as usize
+                } else {
+                    0
+                };
+                let dst_off = (cluster_global_off + rel_start as u64 - req_off) as usize;
+                let copy_len = std::cmp::min(cluster_buf.len() - rel_start, dst.len() - dst_off);
+                dst[dst_off..dst_off + copy_len]
+                    .copy_from_slice(&cluster_buf[rel_start..rel_start + copy_len]);
+            };
+
+        // Walk the run-list ---------------------------------------------------
+        let mut cur_vcn = 0u64;
+        for (lcn, run_len) in decode_run_list(run_list) {
+            let run_first = cur_vcn;
+            let run_last = cur_vcn + run_len - 1;
+            if run_last < first_vcn || run_first > last_vcn {
+                cur_vcn += run_len;
+                continue; // no overlap
+            }
+
+            for i in 0..run_len {
+                let vcn = cur_vcn + i;
+                if vcn < first_vcn || vcn > last_vcn {
+                    continue;
+                }
+
+                let global_byte_off = vcn * cluster_size;
+                let cluster_off_in_out = global_byte_off.saturating_sub(offset);
+                if cluster_off_in_out as usize >= wanted {
+                    continue;
+                }
+
+                if lcn < 0 {
+                    // sparse cluster
+                    // already zero-initialised – nothing to copy
+                    continue;
+                }
+
+                let phys_off = (lcn as u64 + i) * cluster_size;
+                self.body.seek(SeekFrom::Start(phys_off))?;
+                let mut buf = vec![0u8; cluster_size as usize];
+                self.body.read_exact(&mut buf)?;
+                copy_from_cluster(&mut out, &buf, global_byte_off, offset);
+            }
+            cur_vcn += run_len;
+            if cur_vcn > last_vcn {
+                break; // done
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Convenience wrapper: read the first `length` bytes of the file.
+    pub fn read_file_prefix(
+        &mut self,
+        record: &MFTRecord,
+        length: usize,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
+        self.read_file_slice(record, 0, length)
+    }
 }
 
 // helper: decode the run-list into (LCN, length_in_clusters) pairs
