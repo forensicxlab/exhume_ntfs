@@ -515,7 +515,7 @@ fn parse_attribute<R: Read + Seek>(
         let highest_vcn = cursor.read_u64::<LittleEndian>().unwrap();
         let mapping_pairs_offset = cursor.read_u16::<LittleEndian>().unwrap();
         let compression_unit = cursor.read_u16::<LittleEndian>().unwrap();
-        cursor.seek(SeekFrom::Current(5)).unwrap();
+        cursor.seek(SeekFrom::Current(4)).unwrap();
         let allocated_size = cursor.read_u64::<LittleEndian>().unwrap();
         let real_size = cursor.read_u64::<LittleEndian>().unwrap();
         let initialized_size = cursor.read_u64::<LittleEndian>().unwrap();
