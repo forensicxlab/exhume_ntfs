@@ -287,6 +287,8 @@ dependencies = [
 [[package]]
 name = "exhume_body"
 version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3c0d061ec67b7a06d7e424aa55a57fc5c76d4d9042c4ebd523a2a8fda92631b"
 dependencies = [
  "clap",
  "clap-num",
@@ -301,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "exhume_ntfs"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "byteorder",
  "capstone",

@@ -1,6 +1,6 @@
 [package]
 name = "exhume_ntfs"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Extract NT Filesystem specific artefacts from a given Partition."
 documentation = "https://www.forensicxlab.com/docs/category/exhume---ntfs"
@@ -10,9 +10,8 @@ readme = "README.md"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
-exhume_body = { path = "../exhume_body" }
 
-#exhume_body = "=0.3.3"
+exhume_body = "=0.3.4"
 
 log = "0.4.25"
 clap = "4.0"
