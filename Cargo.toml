@@ -10,7 +10,9 @@ readme = "README.md"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
-exhume_body = "=0.3.3"
+exhume_body = { path = "../exhume_body" }
+
+#exhume_body = "=0.3.3"
 
 log = "0.4.25"
 clap = "4.0"

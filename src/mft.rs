@@ -340,10 +340,10 @@ impl MFTRecord {
             let std = std.unwrap();
             let mut t = Table::new();
             t.add_row(row!["$STANDARD_INFORMATION"]);
-            t.add_row(row![b -> "Created", std.created]);
-            t.add_row(row![b -> "File Modified", std.modified]);
-            t.add_row(row![b -> "MFT Modified", std.mft_modified]);
-            t.add_row(row![b -> "Accessed", std.accessed]);
+            t.add_row(row![b -> "Created", filetime_to_local_datetime(std.created)]);
+            t.add_row(row![b -> "File Modified", filetime_to_local_datetime(std.modified)]);
+            t.add_row(row![b -> "MFT Modified", filetime_to_local_datetime(std.mft_modified)]);
+            t.add_row(row![b -> "Accessed", filetime_to_local_datetime(std.accessed)]);
             t.add_row(row![b -> "Flags", si_flags_to_string(std.file_attrs)]);
             t.add_row(row![b -> "Owner ID", std.owner_id.map_or("‑".into(), |v| v.to_string())]);
             t.add_row(
@@ -371,10 +371,19 @@ impl MFTRecord {
                 t.add_row(row![b -> "Actual", fname.real_size]);
                 t.add_row(row!["Flags", record_flags_to_string(fname.flags as u16)]);
                 t.add_row(row![b -> "Timestamps", ""]);
-                t.add_row(row!["‑ Created", fname.created]);
-                t.add_row(row!["‑ Modified", fname.modified]);
-                t.add_row(row!["‑ MFT Mod", fname.mft_modified]);
-                t.add_row(row!["‑ Accessed", fname.accessed]);
+                t.add_row(row!["‑ Created", filetime_to_local_datetime(fname.created)]);
+                t.add_row(row![
+                    "‑ Modified",
+                    filetime_to_local_datetime(fname.modified)
+                ]);
+                t.add_row(row![
+                    "‑ MFT Mod",
+                    filetime_to_local_datetime(fname.mft_modified)
+                ]);
+                t.add_row(row![
+                    "‑ Accessed",
+                    filetime_to_local_datetime(fname.accessed)
+                ]);
                 t.add_row(row!["", ""]); // blank separator
             }
             out.push('\n');
@@ -594,7 +603,7 @@ impl TryFrom<u32> for AttributeType {
     }
 }
 
-fn filetime_to_local_datetime(ft: u64) -> String {
+pub fn filetime_to_local_datetime(ft: u64) -> String {
     let micros_since_1601 = ft / 10;
     const DELTA_MICROS: i64 = 116_444_736_000_000_00;
     let unix_micros = micros_since_1601 as i64 - DELTA_MICROS;
@@ -609,10 +618,10 @@ fn filetime_to_local_datetime(ft: u64) -> String {
 /// Parsed $STANDARD_INFORMATION (covers v0 & v1, optionally v2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StandardInformation {
-    pub created: String,
-    pub modified: String,
-    pub mft_modified: String,
-    pub accessed: String,
+    pub created: u64,
+    pub modified: u64,
+    pub mft_modified: u64,
+    pub accessed: u64,
     pub file_attrs: u32,
     pub max_versions: u32,
     pub version_number: u32,
@@ -629,10 +638,10 @@ impl StandardInformation {
             return None;
         }
         let mut cur = Cursor::new(raw);
-        let created = filetime_to_local_datetime(cur.read_u64::<LittleEndian>().ok()?);
-        let modified = filetime_to_local_datetime(cur.read_u64::<LittleEndian>().ok()?);
-        let mft_modified = filetime_to_local_datetime(cur.read_u64::<LittleEndian>().ok()?);
-        let accessed = filetime_to_local_datetime(cur.read_u64::<LittleEndian>().ok()?);
+        let created = cur.read_u64::<LittleEndian>().ok()?;
+        let modified = cur.read_u64::<LittleEndian>().ok()?;
+        let mft_modified = cur.read_u64::<LittleEndian>().ok()?;
+        let accessed = cur.read_u64::<LittleEndian>().ok()?;
         let file_attrs = cur.read_u32::<LittleEndian>().ok()?;
         let max_versions = cur.read_u32::<LittleEndian>().ok()?;
         let version_number = cur.read_u32::<LittleEndian>().ok()?;
@@ -657,6 +666,7 @@ impl StandardInformation {
         } else {
             None
         };
+
         Some(Self {
             created,
             modified,
@@ -674,7 +684,7 @@ impl StandardInformation {
     }
 }
 
-/// Parsed $FILE_NAME attribute (first 66 bytes).
+// ----- FileNameAttr -----
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileNameAttr {
     pub parent_ref: u64,
@@ -683,10 +693,10 @@ pub struct FileNameAttr {
     pub real_size: u64,
     pub name: String,
     pub flags: u32,
-    pub created: String,
-    pub modified: String,
-    pub mft_modified: String,
-    pub accessed: String,
+    pub created: u64,      // FILETIME
+    pub modified: u64,     // FILETIME
+    pub mft_modified: u64, // FILETIME
+    pub accessed: u64,     // FILETIME
 }
 
 impl FileNameAttr {
@@ -698,16 +708,19 @@ impl FileNameAttr {
         let parent_raw = cur.read_u64::<LittleEndian>().ok()?;
         let parent_ref = parent_raw & 0x0000_FFFF_FFFF_FFFF;
         let parent_seq = (parent_raw >> 48) as u16;
-        let created = filetime_to_local_datetime(cur.read_u64::<LittleEndian>().ok()?);
-        let modified = filetime_to_local_datetime(cur.read_u64::<LittleEndian>().ok()?);
-        let mft_modified = filetime_to_local_datetime(cur.read_u64::<LittleEndian>().ok()?);
-        let accessed = filetime_to_local_datetime(cur.read_u64::<LittleEndian>().ok()?);
+
+        let created = cur.read_u64::<LittleEndian>().ok()?; // FILETIME
+        let modified = cur.read_u64::<LittleEndian>().ok()?; // FILETIME
+        let mft_modified = cur.read_u64::<LittleEndian>().ok()?; // FILETIME
+        let accessed = cur.read_u64::<LittleEndian>().ok()?; // FILETIME
+
         let allocated_size = cur.read_u64::<LittleEndian>().ok()?;
         let real_size = cur.read_u64::<LittleEndian>().ok()?;
         let flags = cur.read_u32::<LittleEndian>().ok()?;
         cur.read_u32::<LittleEndian>().ok()?; // reparse value
         let name_len = cur.read_u8().ok()? as usize;
         cur.read_u8().ok()?; // namespace
+
         let name_off = 66;
         if raw.len() < name_off + name_len * 2 {
             return None;
@@ -720,6 +733,7 @@ impl FileNameAttr {
                 .collect::<Vec<_>>(),
         )
         .ok()?;
+
         Some(Self {
             parent_ref,
             parent_seq,
@@ -740,10 +754,15 @@ impl FileNameAttr {
             "parent": self.parent_ref,
             "allocated": self.allocated_size,
             "size": self.real_size,
-            "created": self.created,
-            "modified": self.modified,
-            "mft_modified": self.mft_modified,
-            "accessed": self.accessed,
+            // keep JSON human-friendly by rendering as ISO strings
+            "created_raw":       self.created,
+            "modified_raw":      self.modified,
+            "mft_modified_raw":  self.mft_modified,
+            "accessed_raw":      self.accessed,
+            "created":       filetime_to_local_datetime(self.created),
+            "modified":      filetime_to_local_datetime(self.modified),
+            "mft_modified":  filetime_to_local_datetime(self.mft_modified),
+            "accessed":      filetime_to_local_datetime(self.accessed),
             "flags": self.flags,
         })
     }
