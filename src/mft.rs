@@ -83,6 +83,7 @@ pub struct DataStream {
     pub name: String,
     pub size: u64,
     pub resident: bool,
+    pub attr_id: u16,
 }
 
 /// A fully parsed 1 KiB MFT record.
@@ -218,6 +219,7 @@ impl MFTRecord {
                         name: header.name.clone().unwrap_or_default(),
                         size: resident.value_length as u64,
                         resident: true,
+                        attr_id: header.id,
                     })
                 }
                 Attribute::NonResident {
@@ -229,6 +231,7 @@ impl MFTRecord {
                         name: header.name.clone().unwrap_or_default(),
                         size: non_resident.real_size,
                         resident: false,
+                        attr_id: header.id,
                     })
                 }
                 _ => None,
@@ -880,42 +883,49 @@ impl DirectoryEntry {
     }
 }
 
-fn parse_index_root(raw: &[u8]) -> Option<Vec<DirectoryEntry>> {
-    if raw.len() < 0x18 {
+pub fn parse_index_root(raw: &[u8]) -> Option<Vec<DirectoryEntry>> {
+    if raw.len() < 0x20 {
+        // need at least ROOT(0x10) + HEADER(0x10)
         return None;
     }
     let mut cur = Cursor::new(raw);
-    cur.read_u32::<LittleEndian>().ok()?; // attr‑type
+
+    // INDEX_ROOT (0x10)
+    cur.read_u32::<LittleEndian>().ok()?; // attr-type
     cur.read_u32::<LittleEndian>().ok()?; // collation
-    cur.read_u32::<LittleEndian>().ok()?; // idx blk size
-    cur.read_u8().ok()?;
-    cur.seek(SeekFrom::Current(3)).ok()?;
+    cur.read_u32::<LittleEndian>().ok()?; // index block size
+    cur.read_u8().ok()?; // clusters per index block
+    cur.seek(SeekFrom::Current(3)).ok()?; // padding
+
+    // INDEX_HEADER begins at offset 0x10 within raw
+    let index_header_base = 0x10usize;
+
+    // INDEX_HEADER (0x10)
     let entries_offset = cur.read_u32::<LittleEndian>().ok()? as usize;
     let total_size = cur.read_u32::<LittleEndian>().ok()? as usize;
-    cur.read_u32::<LittleEndian>().ok()?; // alloc sz
-    let flags = cur.read_u8().ok()?;
+    cur.read_u32::<LittleEndian>().ok()?; // allocated size (unused)
+    let _flags = cur.read_u8().ok()?;
     cur.seek(SeekFrom::Current(3)).ok()?;
-    let start = entries_offset;
-    let end = entries_offset + total_size;
+
+    let start = index_header_base + entries_offset;
+    let end = start + total_size;
+
     let mut off = start;
     let mut out = Vec::new();
+
     while off + 0x10 <= end && off + 0x10 <= raw.len() {
         let slice = &raw[off..];
         if let Some((entry, consumed)) = DirectoryEntry::from_slice(slice) {
-            let f = entry.flags;
             if entry.name != "." && entry.name != ".." {
-                out.push(entry);
+                out.push(entry.clone());
             }
-            if f & 0x02 != 0 {
+            if entry.flags & 0x02 != 0 {
                 break;
-            }
+            } // last entry
             off += consumed;
         } else {
             break;
         }
-    }
-    if flags & 0x01 != 0 {
-        // Indicates there is an INDEX_ALLOCATION – handled elsewhere.
     }
     Some(out)
 }

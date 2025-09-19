@@ -3,17 +3,18 @@
 // - https://en.wikipedia.org/wiki/NTFS
 // TODO: include more logs and error handling.
 
+use log::{debug, error};
+use mft::{Attribute, AttributeType, DirectoryEntry, MFTRecord};
+use pbs::PartitionBootSector;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::error::Error;
 use std::io::{Read, Seek, SeekFrom};
-
-use log::{debug, error, info};
-use mft::{Attribute, AttributeType, DirectoryEntry, MFTRecord};
-use pbs::PartitionBootSector;
+use usnjrn::UsnRecord;
 
 pub mod mft;
 pub mod pbs;
+pub mod usnjrn;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NTFS<T: Read + Seek> {
@@ -143,7 +144,7 @@ impl<T: Read + Seek> NTFS<T> {
         });
 
         if let Some(run_list) = idx_alloc_attr {
-            info!("Directory {:} uses non-resident index – walking it", dir_id);
+            debug!("Directory {:} uses non-resident index – walking it", dir_id);
 
             let bytes_per_sec = self.pbs.bytes_per_sector as usize;
             let bytes_per_clu = self.pbs.cluster_size() as usize;
@@ -267,7 +268,7 @@ impl<T: Read + Seek> NTFS<T> {
         offset: u64,
         length: usize,
     ) -> Result<Vec<u8>, Box<dyn Error>> {
-        // --- Locate the unnamed $DATA attribute ----------------------------
+        // Locate the unnamed $DATA attribute
         let data_attr = record
             .attributes
             .iter()
@@ -278,9 +279,7 @@ impl<T: Read + Seek> NTFS<T> {
             })
             .ok_or("unnamed $DATA attribute not found")?;
 
-        // --------------------------------------------------------------------
         // 1. Small, resident file – trivial slice
-        // --------------------------------------------------------------------
         if let Attribute::Resident { value, .. } = data_attr {
             if offset >= value.len() as u64 || length == 0 {
                 return Ok(Vec::new());
@@ -290,9 +289,7 @@ impl<T: Read + Seek> NTFS<T> {
             return Ok(value[start..end].to_vec());
         }
 
-        // --------------------------------------------------------------------
         // 2. Non-resident file – walk the run-list on demand
-        // --------------------------------------------------------------------
         let Attribute::NonResident {
             non_resident,
             run_list,
@@ -328,7 +325,7 @@ impl<T: Read + Seek> NTFS<T> {
                     .copy_from_slice(&cluster_buf[rel_start..rel_start + copy_len]);
             };
 
-        // Walk the run-list ---------------------------------------------------
+        // Walk the run-list
         let mut cur_vcn = 0u64;
         for (lcn, run_len) in decode_run_list(run_list) {
             let run_first = cur_vcn;
@@ -378,6 +375,189 @@ impl<T: Read + Seek> NTFS<T> {
         length: usize,
     ) -> Result<Vec<u8>, Box<dyn Error>> {
         self.read_file_slice(record, 0, length)
+    }
+
+    /// Read a named $DATA stream (Alternate Data Stream) by its name (e.g., "$J").
+    pub fn read_named_stream(
+        &mut self,
+        record: &MFTRecord,
+        stream_name: &str,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
+        use crate::mft::{Attribute, AttributeType};
+
+        let data_attr = record
+            .attributes
+            .iter()
+            .find(|a| match a {
+                Attribute::Resident { header, .. } | Attribute::NonResident { header, .. } => {
+                    header.attr_type == AttributeType::Data
+                        && header.name_length > 0
+                        && header
+                            .name
+                            .as_deref()
+                            .map(|n| n.eq_ignore_ascii_case(stream_name))
+                            .unwrap_or(false)
+                }
+            })
+            .ok_or_else(|| format!("named $DATA stream '{}' not found", stream_name))?;
+
+        match data_attr {
+            Attribute::Resident { value, .. } => Ok(value.clone()),
+            Attribute::NonResident {
+                non_resident,
+                run_list,
+                ..
+            } => {
+                let cluster_size = self.pbs.cluster_size() as usize;
+                let mut out = Vec::with_capacity(non_resident.real_size as usize);
+
+                for (lcn, len) in decode_run_list(run_list) {
+                    let byte_len = len as usize * cluster_size;
+
+                    if lcn < 0 {
+                        out.extend(std::iter::repeat(0u8).take(byte_len)); // sparse
+                    } else {
+                        let off = lcn as u64 * cluster_size as u64;
+                        self.body.seek(SeekFrom::Start(off))?;
+                        let mut buf = vec![0u8; byte_len];
+                        self.body.read_exact(&mut buf)?;
+                        out.extend_from_slice(&buf);
+                    }
+                }
+
+                out.truncate(non_resident.real_size as usize);
+                Ok(out)
+            }
+        }
+    }
+
+    /// Return raw bytes of $UsnJrnl:$J, where `$UsnJrnl` is provided via its **MFT record id**.
+    pub fn usn_journal_raw_from_file_id(
+        &mut self,
+        file_id: u64,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
+        let rec = self.get_file_id(file_id)?;
+        // The named stream for the journal data is **"$J"**
+        self.read_named_stream(&rec, "$J")
+    }
+
+    /// Parse and return USN records from $UsnJrnl:$J for the given **MFT record id**.
+    pub fn usn_journal_from_file_id(
+        &mut self,
+        file_id: u64,
+    ) -> Result<Vec<crate::usnjrn::UsnRecord>, Box<dyn Error>> {
+        let raw = self.usn_journal_raw_from_file_id(file_id)?;
+        let mut recs = crate::usnjrn::parse_usn_journal(&raw);
+        self.enrich_usn_paths_from_parent_ref(&mut recs);
+        Ok(recs)
+    }
+
+    /// Build a full NTFS path (e.g., `\Windows\System32`) starting from a **directory** MFT id.
+    /// This follows the *parent* links only. It does not append a filename.
+    fn build_parent_path_from_parent_ref(&mut self, mut parent_id: u64) -> Option<String> {
+        // Quick guards
+        if parent_id == 0 {
+            return Some("\\".to_string()); // unknown -> treat as root-ish
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut steps = 0usize;
+
+        loop {
+            steps += 1;
+            if steps > 8192 {
+                break;
+            } // safety
+            if parent_id == 5 {
+                // prepend root and stop
+                parts.reverse();
+                let mut p = String::from("\\");
+                p.push_str(&parts.join("\\"));
+                return Some(p);
+            }
+            if !seen.insert(parent_id) {
+                break; // cycle guard
+            }
+
+            let rec = match self.get_file_id(parent_id) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+
+            if let Some(name) = rec.primary_name() {
+                if !name.is_empty() && name != "." && name != ".." {
+                    parts.push(name);
+                }
+            }
+
+            match rec.parent_file_id() {
+                Some(pid) if pid != parent_id => parent_id = pid,
+                _ => break,
+            }
+        }
+
+        // If we got here without hitting root, we still return what we have.
+        parts.reverse();
+        let mut p = String::from("\\");
+        if !parts.is_empty() {
+            p.push_str(&parts.join("\\"));
+        }
+        Some(p)
+    }
+
+    /// Get the current primary file name for an MFT record id.
+    fn current_name_from_file_ref(&mut self, file_id: u64) -> Option<String> {
+        self.get_file_id(file_id).ok()?.primary_name()
+    }
+
+    /// Enrich USN records strictly from parent_ref and file_ref:
+    /// - parent_path: walk from parent_ref up to root
+    /// - name: use USN name if present, otherwise fetch from MFT
+    /// - full_path: parent_path + name (or entire path from file_ref if resolvable)
+    pub fn enrich_usn_paths_from_parent_ref(&mut self, recs: &mut [UsnRecord]) {
+        for r in recs.iter_mut() {
+            // 1) Parent path from parent_ref
+            if r.parent_path.is_none() {
+                let parent_id = r.parent_ref_u64(); // mask to 48 bits already
+                r.parent_path = self.build_parent_path_from_parent_ref(parent_id);
+            }
+
+            // 2) Ensure we have the component name
+            if r.name.is_none() {
+                r.name = self.current_name_from_file_ref(r.file_ref_u64());
+            }
+
+            // 3) Full path
+            if r.full_path.is_none() {
+                // Prefer reconstructing via file_ref (gets correct component even for v4)
+                if let Some(fp) = self
+                    .build_parent_path_from_parent_ref(r.parent_ref_u64())
+                    .and_then(|pp| r.name.as_deref().map(|n| join_parent_and_name(&pp, n)))
+                {
+                    r.full_path = Some(fp);
+                } else if let Some(fp) =
+                    self.current_name_from_file_ref(r.file_ref_u64())
+                        .and_then(|n| {
+                            self.build_parent_path_from_parent_ref(r.parent_ref_u64())
+                                .map(|pp| join_parent_and_name(&pp, &n))
+                        })
+                {
+                    r.full_path = Some(fp);
+                }
+            }
+        }
+    }
+}
+
+/// Combine a parent path and a file name safely.
+fn join_parent_and_name(parent: &str, name: &str) -> String {
+    if parent.is_empty() || parent == "\\" {
+        format!("\\{}", name)
+    } else if parent.ends_with('\\') {
+        format!("{}{}", parent, name)
+    } else {
+        format!("{}\\{}", parent, name)
     }
 }
 

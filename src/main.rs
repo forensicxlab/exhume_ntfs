@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 fn main() {
     let matches = Command::new("exhume_ntfs")
-        .version("0.1.5")
+        .version("0.1.6")
         .author("ForensicXlab")
         .about("Exhume the metadata from an Microsoft NTFS filesystem.")
         .arg(
@@ -41,6 +41,13 @@ fn main() {
                 .value_parser(maybe_hex::<u64>)
                 .required(true)
                 .help("The size of the NTFS partition in sectors (decimal or hex)."),
+        )
+        .arg(
+            Arg::new("usnjrnl")
+                .long("usnjrnl")
+                .action(ArgAction::SetTrue)
+                .requires("file_id")
+                .help("Parse and display entries from $UsnJrnl:$J."),
         )
         .arg(
             Arg::new("pbs")
@@ -111,6 +118,7 @@ fn main() {
     let offset = matches.get_one::<u64>("offset").unwrap();
     let size = matches.get_one::<u64>("size").unwrap();
     let show_pbs = matches.get_flag("pbs");
+    let show_usn = matches.get_flag("usnjrnl");
     let show_bootstrap = matches.get_flag("bootstrap");
     let dump_file = matches.get_flag("dump");
     let json_output = matches.get_flag("json");
@@ -149,6 +157,32 @@ fn main() {
         }
     }
 
+    if show_usn {
+        if file_id == 0 {
+            error!("--usnjrnl requires --file <MFT record id> of the $UsnJrnl file.");
+            return;
+        }
+
+        match filesystem.usn_journal_from_file_id(file_id as u64) {
+            Ok(records) => {
+                if json_output {
+                    let arr: Vec<Value> = records.iter().map(|r| r.to_json()).collect();
+                    let j = json!({ "usn_records": arr });
+                    println!("{}", serde_json::to_string_pretty(&j).unwrap());
+                } else {
+                    for r in records {
+                        println!("{}", r.to_string());
+                        println!();
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to read $UsnJrnl:$J from record {}: {}", file_id, e);
+            }
+        }
+        return;
+    }
+
     if show_bootstrap {
         println!("{}", filesystem.pbs.disassemble_bootstrap_code());
     }
@@ -162,12 +196,28 @@ fn main() {
                 .expect("Could not list directory entries for this record.");
 
             if json_output {
-                let arr: Vec<Value> = entries.iter().map(|de| de.to_json()).collect();
+                let arr: Vec<Value> = entries.iter().map(|de| {
+                    // Trying to read ADS for each entry
+                    let ads_json = match filesystem.get_file_id(de.file_id as u64) {
+                        Ok(rec) => rec.alternate_data_streams().into_iter().map(|s| {
+                            json!({"name": s.name, "size": s.size, "resident": s.resident, "attr_id": s.attr_id})
+                        }).collect::<Vec<_>>(),
+                        Err(_) => Vec::new(),
+                    };
+                    json!({ "file_id": de.file_id, "name": de.name, "ads": ads_json })
+                }).collect();
                 let dir_json = json!({ "dir_entries": arr });
                 println!("{}", serde_json::to_string_pretty(&dir_json).unwrap());
             } else {
-                for file in entries {
-                    println!("{}  {}", file.file_id, file.name);
+                for de in entries {
+                    // base entry
+                    println!("{}  {}", de.file_id, de.name);
+
+                    if let Ok(rec) = filesystem.get_file_id(de.file_id as u64) {
+                        for s in rec.alternate_data_streams() {
+                            println!("{}-{}  {}:{}", de.file_id, s.attr_id, de.name, s.name);
+                        }
+                    }
                 }
             }
         } else if dump_file {
