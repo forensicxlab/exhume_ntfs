@@ -1,6 +1,6 @@
 [package]
 name = "exhume_ntfs"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "Extract NT Filesystem specific artefacts from a given Partition."
 documentation = "https://www.forensicxlab.com/docs/category/exhume---ntfs"

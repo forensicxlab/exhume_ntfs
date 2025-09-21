@@ -11,6 +11,7 @@ use chrono::{TimeZone, Utc};
 use prettytable::{Table, row};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 
 // --- ADD near the top of usnjrn.rs (below use ... lines) ---
@@ -136,7 +137,8 @@ pub struct UsnRecord {
     /// 128-bit file references (lower 64 bits match the traditional NTFS reference number).
     pub file_ref: u128,
     pub parent_ref: u128,
-
+    pub file_mft_record_number: u64,
+    pub parent_mft_record_number: u64,
     pub usn: i64,
     pub timestamp: u64, // FILETIME (UTC)
     pub reason: u32,
@@ -150,12 +152,24 @@ pub struct UsnRecord {
     /// v4 range tracking (optional)
     pub remaining_extents: Option<u32>,
     pub extents: Option<Vec<UsnExtent>>,
-
-    /// Optional forensic enrichment fields (filled by the host crate after parsing)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub full_path: Option<String>,
+    pub reused_records: Option<Vec<ReusedElement>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum ReuseReason {
+    MultipleSequencesInJournal, // this FRN index shows >1 seq across the journal slice
+    CurrentSeqDiffersFromUsn,   // current MFT seq != the USN record’s seq (file or parent)
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReusedElement {
+    pub index: u64,               // 48-bit FRN index
+    pub current_seq: Option<u16>, // current MFT sequence if we looked it up
+    pub seen_sequences: Vec<u16>, // distinct sequences seen for this index in the journal slice
+    pub name: Option<String>,     // best name we had when we touched it in the path
+    pub reason: Vec<ReuseReason>, // why we flagged it
 }
 
 impl UsnRecord {
@@ -165,6 +179,16 @@ impl UsnRecord {
     }
     pub fn parent_ref_u64(&self) -> u64 {
         (self.parent_ref & 0x0000_FFFF_FFFF_FFFF) as u64
+    }
+
+    /// Sequence helpers for MFT reuse detection (high 16 bits of the lower 64).
+    pub fn file_ref_seq(&self) -> u16 {
+        let low64 = (self.file_ref & 0x0000_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF) as u64;
+        ((low64 >> 48) & 0xFFFF) as u16
+    }
+    pub fn parent_ref_seq(&self) -> u16 {
+        let low64 = (self.parent_ref & 0x0000_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF) as u64;
+        ((low64 >> 48) & 0xFFFF) as u16
     }
 
     pub fn parse(buf: &[u8]) -> Option<Self> {
@@ -200,15 +224,17 @@ impl UsnRecord {
         let file_attrs = c.read_u32::<LittleEndian>().ok()?;
         let name_len = c.read_u16::<LittleEndian>().ok()? as usize;
         let name_offset = c.read_u16::<LittleEndian>().ok()? as usize;
-
         let name = read_utf16_name(buf, record_len as usize, name_offset, name_len)?;
-
+        let file_mft_record_number = (file_ref & 0x0000_FFFF_FFFF_FFFF) as u64;
+        let parent_mft_record_number = (parent_ref & 0x0000_FFFF_FFFF_FFFF) as u64;
         Some(Self {
             record_len,
             major_version: maj,
             minor_version: min,
             file_ref,
             parent_ref,
+            file_mft_record_number,
+            parent_mft_record_number,
             usn,
             timestamp,
             reason,
@@ -220,6 +246,7 @@ impl UsnRecord {
             extents: None,
             parent_path: None,
             full_path: None,
+            reused_records: None,
         })
     }
 
@@ -237,7 +264,8 @@ impl UsnRecord {
         let file_attrs = c.read_u32::<LittleEndian>().ok()?;
         let name_len = c.read_u16::<LittleEndian>().ok()? as usize;
         let name_offset = c.read_u16::<LittleEndian>().ok()? as usize;
-
+        let file_mft_record_number = (file_ref & 0x0000_FFFF_FFFF_FFFF) as u64;
+        let parent_mft_record_number = (parent_ref & 0x0000_FFFF_FFFF_FFFF) as u64;
         let name = read_utf16_name(buf, record_len as usize, name_offset, name_len)?;
 
         Some(Self {
@@ -246,6 +274,8 @@ impl UsnRecord {
             minor_version: min,
             file_ref,
             parent_ref,
+            file_mft_record_number,
+            parent_mft_record_number,
             usn,
             timestamp,
             reason,
@@ -257,6 +287,7 @@ impl UsnRecord {
             extents: None,
             parent_path: None,
             full_path: None,
+            reused_records: None,
         })
     }
 
@@ -274,7 +305,8 @@ impl UsnRecord {
         let remaining_extents = c.read_u32::<LittleEndian>().ok()?;
         let number_of_extents = c.read_u16::<LittleEndian>().ok()? as usize;
         let extent_size = c.read_u16::<LittleEndian>().ok()? as usize;
-
+        let file_mft_record_number = (file_ref & 0x0000_FFFF_FFFF_FFFF) as u64;
+        let parent_mft_record_number = (parent_ref & 0x0000_FFFF_FFFF_FFFF) as u64;
         // Extents array follows; each extent struct is (Offset, Length) as i64
         let mut extents = Vec::with_capacity(number_of_extents);
         for _ in 0..number_of_extents {
@@ -301,6 +333,8 @@ impl UsnRecord {
             minor_version: min,
             file_ref,
             parent_ref,
+            file_mft_record_number,
+            parent_mft_record_number,
             usn,
             // v4 doesn't embed a timestamp; many readers copy the following v3's
             // TimeStamp for user-facing output. We keep 0 here to avoid misattribution.
@@ -315,6 +349,7 @@ impl UsnRecord {
             extents: Some(extents),
             parent_path: None,
             full_path: None,
+            reused_records: None,
         })
     }
 
@@ -355,6 +390,8 @@ impl UsnRecord {
         }
         t.add_row(row![b -> "File Ref", format!("{:#x}", self.file_ref)]);
         t.add_row(row![b -> "Parent Ref", format!("{:#x}", self.parent_ref)]);
+        t.add_row(row![b -> "File MFT record #", self.file_mft_record_number]);
+        t.add_row(row![b -> "Parent MFT record #", self.parent_mft_record_number]);
         if let Some(n) = &self.name {
             t.add_row(row![b -> "Name", n]);
         }
@@ -375,6 +412,35 @@ impl UsnRecord {
                 t.add_row(row![b -> "RemainingExtents", rem]);
             }
         }
+        if let Some(rr) = &self.reused_records {
+            if !rr.is_empty() {
+                let mut subtbl = prettytable::Table::new();
+                subtbl.add_row(row!["Index", "Current Seq", "Seen Seqs", "Reasons", "Name"]);
+                for e in rr {
+                    subtbl.add_row(row![
+                        e.index,
+                        e.current_seq.map_or("-".to_string(), |s| s.to_string()),
+                        if e.seen_sequences.is_empty() {
+                            "-".to_string()
+                        } else {
+                            e.seen_sequences
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        },
+                        e.reason
+                            .iter()
+                            .map(|r| format!("{:?}", r))
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                        e.name.clone().unwrap_or_else(|| "-".into())
+                    ]);
+                }
+                // Add the sub-table as a single cell in the main table
+                t.add_row(row![b -> "Reused records", subtbl.to_string()]);
+            }
+        }
         t.to_string()
     }
 
@@ -391,6 +457,8 @@ impl UsnRecord {
             "file_attrs": self.file_attrs,
             "file_ref_u128": self.file_ref.to_string(),
             "parent_ref_u128": self.parent_ref.to_string(),
+            "file_mft_record_number": self.file_mft_record_number,
+            "parent_mft_record_number": self.parent_mft_record_number,
             "file_ref": self.file_ref_u64(),
             "parent_ref": self.parent_ref_u64(),
             "name": self.name,
@@ -470,4 +538,19 @@ pub fn parse_usn_journal(stream: &[u8]) -> Vec<UsnRecord> {
         }
     }
     out
+}
+
+/// For each FRN index, collect all distinct sequences seen in this journal slice.
+pub fn build_reuse_index(records: &[UsnRecord]) -> HashMap<u64, HashSet<u16>> {
+    let mut map: HashMap<u64, HashSet<u16>> = HashMap::new();
+
+    for r in records {
+        map.entry(r.file_ref_u64())
+            .or_default()
+            .insert(r.file_ref_seq());
+        map.entry(r.parent_ref_u64())
+            .or_default()
+            .insert(r.parent_ref_seq());
+    }
+    map
 }

@@ -10,11 +10,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::error::Error;
 use std::io::{Read, Seek, SeekFrom};
-use usnjrn::UsnRecord;
+use usnjrn::{ReuseReason, ReusedElement, UsnRecord};
 
 pub mod mft;
 pub mod pbs;
 pub mod usnjrn;
+
+#[derive(Clone, Copy, Debug)]
+pub enum ReuseCheck {
+    Off,           // no reuse detection, fastest
+    JournalOnly,   // journal-only (cheap)
+    JournalAndMFT, // journal + current MFT cross-check (most accurate, slower)
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NTFS<T: Read + Seek> {
@@ -441,14 +448,39 @@ impl<T: Read + Seek> NTFS<T> {
         self.read_named_stream(&rec, "$J")
     }
 
-    /// Parse and return USN records from $UsnJrnl:$J for the given **MFT record id**.
     pub fn usn_journal_from_file_id(
         &mut self,
         file_id: u64,
-    ) -> Result<Vec<crate::usnjrn::UsnRecord>, Box<dyn Error>> {
+        mode: ReuseCheck,
+    ) -> Result<Vec<crate::usnjrn::UsnRecord>, Box<dyn std::error::Error>> {
         let raw = self.usn_journal_raw_from_file_id(file_id)?;
         let mut recs = crate::usnjrn::parse_usn_journal(&raw);
-        self.enrich_usn_paths_from_parent_ref(&mut recs);
+
+        match mode {
+            ReuseCheck::Off => {
+                // Just build paths; no reuse computation
+                self.enrich_usn_paths_from_parent_ref(&mut recs);
+            }
+            ReuseCheck::JournalOnly => {
+                let reuse_index = crate::usnjrn::build_reuse_index(&recs);
+                self.enrich_usn_paths_from_parent_ref(&mut recs);
+                for r in recs.iter_mut() {
+                    // enrich *without* current MFT seq comparisons
+                    self.enrich_paths_with_reuse(r, &reuse_index); // ensure this helper avoids “CurrentSeqDiffersFromUsn”
+                }
+            }
+            ReuseCheck::JournalAndMFT => {
+                let reuse_index = crate::usnjrn::build_reuse_index(&recs);
+                self.enrich_usn_paths_from_parent_ref(&mut recs);
+                // Optional: also mark via current MFT first (use your helper if you added it)
+                // self.mark_reuse_via_current_mft(&mut recs);
+                for r in recs.iter_mut() {
+                    // enrich WITH current MFT seq comparisons
+                    self.enrich_paths_with_reuse(r, &reuse_index); // make sure this helper includes CurrentSeqDiffersFromUsn
+                }
+            }
+        }
+
         Ok(recs)
     }
 
@@ -546,6 +578,149 @@ impl<T: Read + Seek> NTFS<T> {
                     r.full_path = Some(fp);
                 }
             }
+        }
+    }
+
+    /// Current MFT sequence for a record id (48-bit index).
+    fn current_mft_seq(&mut self, file_id: u64) -> Option<u16> {
+        let rec = self.get_file_id(file_id).ok()?;
+        Some(rec.header.sequence_number)
+    }
+
+    /// Enrich a single USN record with paths and a list of reused elements encountered while
+    /// walking the parent chain. Uses:
+    ///   - journal-wide reuse index (multiple sequences seen) for *any* path component
+    ///   - direct USN vs current MFT sequence check for the *file itself* and *immediate parent*
+    fn enrich_paths_with_reuse(
+        &mut self,
+        r: &mut UsnRecord,
+        reuse_index: &std::collections::HashMap<u64, std::collections::HashSet<u16>>,
+    ) {
+        // 1) Build parent path via current MFT (your existing logic)
+        if r.parent_path.is_none() || r.full_path.is_none() || r.name.is_none() {
+            // Use existing function to populate parent_path/name/full_path.
+            // It already prefers current MFT for missing bits.
+            self.enrich_usn_paths_from_parent_ref(std::slice::from_mut(r));
+        }
+
+        // 2) Walk the chain again (via current MFT) to collect reused elements.
+        let mut reused: Vec<ReusedElement> = Vec::new();
+
+        // Helper to push a reused element if conditions match
+        let mut maybe_push = |index: u64,
+                              name: Option<String>,
+                              journal_seqs: Option<&std::collections::HashSet<u16>>,
+                              reasons: Vec<ReuseReason>,
+                              cur_seq: Option<u16>| {
+            let mut rs = reasons;
+            let mut seen = Vec::<u16>::new();
+            if let Some(s) = journal_seqs {
+                if s.len() > 1 {
+                    if !rs
+                        .iter()
+                        .any(|r| matches!(r, ReuseReason::MultipleSequencesInJournal))
+                    {
+                        rs.push(ReuseReason::MultipleSequencesInJournal);
+                    }
+                    seen.extend(s.iter().copied());
+                    seen.sort_unstable();
+                    seen.dedup();
+                }
+            }
+            if !rs.is_empty() {
+                reused.push(ReusedElement {
+                    index,
+                    current_seq: cur_seq,
+                    seen_sequences: seen,
+                    name,
+                    reason: rs,
+                });
+            }
+        };
+
+        // 2a) File itself
+        let file_idx = r.file_ref_u64();
+        let file_cur_seq = self.current_mft_seq(file_idx);
+        let mut file_reasons = Vec::new();
+        if let Some(cur) = file_cur_seq {
+            if cur != r.file_ref_seq() {
+                file_reasons.push(ReuseReason::CurrentSeqDiffersFromUsn);
+            }
+        }
+        let file_journal_seqs = reuse_index.get(&file_idx);
+        maybe_push(
+            file_idx,
+            r.name.clone(),
+            file_journal_seqs,
+            file_reasons,
+            file_cur_seq,
+        );
+
+        // 2b) Immediate parent
+        let parent_idx = r.parent_ref_u64();
+        let parent_cur_seq = self.current_mft_seq(parent_idx);
+        let mut parent_reasons = Vec::new();
+        if let Some(cur) = parent_cur_seq {
+            if cur != r.parent_ref_seq() {
+                parent_reasons.push(ReuseReason::CurrentSeqDiffersFromUsn);
+            }
+        }
+        // Name for the immediate parent (try current MFT)
+        let parent_name = self
+            .get_file_id(parent_idx)
+            .ok()
+            .and_then(|rec| rec.primary_name());
+        let parent_journal_seqs = reuse_index.get(&parent_idx);
+        maybe_push(
+            parent_idx,
+            parent_name,
+            parent_journal_seqs,
+            parent_reasons,
+            parent_cur_seq,
+        );
+
+        // 2c) All higher ancestors: we don’t have USN-time sequences on this record,
+        // but if the journal-wide map says the index had multiple sequences, flag it.
+        // We reuse your parent-walk (current MFT) to climb up and collect names.
+        let mut chain_names: Vec<(u64, Option<String>)> = Vec::new();
+        // Re-walk parent chain using your helper (stop at root)
+        if let Some(mut pid) = Some(parent_idx) {
+            let mut seen = std::collections::HashSet::new();
+            let mut steps = 0usize;
+            while pid != 0 && pid != 5 && steps < 8192 && seen.insert(pid) {
+                steps += 1;
+                // Record this ancestor
+                let name = self
+                    .get_file_id(pid)
+                    .ok()
+                    .and_then(|rec| rec.primary_name());
+                chain_names.push((pid, name.clone()));
+
+                // Next parent
+                if let Some(next) = self
+                    .get_file_id(pid)
+                    .ok()
+                    .and_then(|rec| rec.parent_file_id())
+                {
+                    pid = next;
+                } else {
+                    break;
+                }
+            }
+        }
+        // For each ancestor (excluding immediate parent—we already did it), push if journal says reused
+        for (idx, name) in chain_names.into_iter().skip(1) {
+            if let Some(seqs) = reuse_index.get(&idx) {
+                if seqs.len() > 1 {
+                    maybe_push(idx, name, Some(seqs), vec![], self.current_mft_seq(idx));
+                }
+            }
+        }
+
+        if !reused.is_empty() {
+            r.reused_records = Some(reused);
+        } else {
+            r.reused_records = Some(Vec::new());
         }
     }
 }

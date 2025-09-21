@@ -1,13 +1,13 @@
 use clap::{Arg, ArgAction, Command, value_parser};
 use clap_num::maybe_hex;
 use exhume_body::{Body, BodySlice};
-use exhume_ntfs::NTFS;
+use exhume_ntfs::{NTFS, ReuseCheck};
 use log::{debug, error};
 use serde_json::{Value, json};
 
 fn main() {
     let matches = Command::new("exhume_ntfs")
-        .version("0.1.6")
+        .version("0.1.7")
         .author("ForensicXlab")
         .about("Exhume the metadata from an Microsoft NTFS filesystem.")
         .arg(
@@ -48,6 +48,28 @@ fn main() {
                 .action(ArgAction::SetTrue)
                 .requires("file_id")
                 .help("Parse and display entries from $UsnJrnl:$J."),
+        )
+        .arg(
+            Arg::new("mode")
+                .long("mode")
+                .value_parser(["off", "journal", "full"])
+                .default_value("journal")
+                .requires("usnjrnl")
+                .help("Reuse detection: off | journal (USN only) | full (USN + current MFT)"),
+        )
+        .arg(
+            Arg::new("filter")
+                .long("filter")
+                .requires("usnjrnl")
+                .value_parser(maybe_hex::<u64>)
+                .help("Filter USN records to those whose file_ref index matches this FRN index (decimal or hex)."),
+        )
+        .arg(
+            Arg::new("match_parent")
+                .long("match_parent")
+                .requires("filter")
+                .action(ArgAction::SetTrue)
+                .help("When filtering, also keep records whose parent_ref index matches."),
         )
         .arg(
             Arg::new("pbs")
@@ -119,6 +141,19 @@ fn main() {
     let size = matches.get_one::<u64>("size").unwrap();
     let show_pbs = matches.get_flag("pbs");
     let show_usn = matches.get_flag("usnjrnl");
+    let reuse_mode_str = matches
+        .get_one::<String>("mode")
+        .map(|s| s.as_str())
+        .unwrap_or("journal");
+    let reuse_mode = match reuse_mode_str {
+        "off" => ReuseCheck::Off,
+        "journal" => ReuseCheck::JournalOnly,
+        "full" => ReuseCheck::JournalAndMFT,
+        _ => ReuseCheck::JournalOnly,
+    };
+
+    let usn_filter_file = matches.get_one::<u64>("filter").copied();
+    let usn_match_parent = matches.get_flag("match_parent");
     let show_bootstrap = matches.get_flag("bootstrap");
     let dump_file = matches.get_flag("dump");
     let json_output = matches.get_flag("json");
@@ -163,8 +198,17 @@ fn main() {
             return;
         }
 
-        match filesystem.usn_journal_from_file_id(file_id as u64) {
-            Ok(records) => {
+        match filesystem.usn_journal_from_file_id(file_id as u64, reuse_mode) {
+            Ok(mut records) => {
+                // Optional filtering by FRN index (file_ref), plus parent match if requested
+                if let Some(fid_idx) = usn_filter_file {
+                    records.retain(|r| {
+                        let file_hit = r.file_ref_u64() == fid_idx;
+                        let parent_hit = usn_match_parent && (r.parent_ref_u64() == fid_idx);
+                        file_hit || parent_hit
+                    });
+                }
+
                 if json_output {
                     let arr: Vec<Value> = records.iter().map(|r| r.to_json()).collect();
                     let j = json!({ "usn_records": arr });
