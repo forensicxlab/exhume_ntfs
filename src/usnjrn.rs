@@ -174,20 +174,21 @@ pub struct ReusedElement {
 
 impl UsnRecord {
     /// Lower 64-bit helpers for MFT lookups
+    /// 48-bit MFT index (mask off the 16-bit sequence)
     pub fn file_ref_u64(&self) -> u64 {
-        (self.file_ref & 0x0000_FFFF_FFFF_FFFF) as u64
+        self.file_ref as u64 & 0x0000_FFFF_FFFF_FFFF
     }
     pub fn parent_ref_u64(&self) -> u64 {
-        (self.parent_ref & 0x0000_FFFF_FFFF_FFFF) as u64
+        self.parent_ref as u64 & 0x0000_FFFF_FFFF_FFFF
     }
 
-    /// Sequence helpers for MFT reuse detection (high 16 bits of the lower 64).
+    /// Sequence helpers stay the same
     pub fn file_ref_seq(&self) -> u16 {
-        let low64 = (self.file_ref & 0x0000_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF) as u64;
+        let low64 = self.file_ref as u64;
         ((low64 >> 48) & 0xFFFF) as u16
     }
     pub fn parent_ref_seq(&self) -> u16 {
-        let low64 = (self.parent_ref & 0x0000_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF) as u64;
+        let low64 = self.parent_ref as u64;
         ((low64 >> 48) & 0xFFFF) as u16
     }
 
@@ -212,6 +213,9 @@ impl UsnRecord {
 
     fn parse_v2(buf: &[u8], record_len: u32, maj: u16, min: u16) -> Option<Self> {
         // Layout per USN_RECORD_V2
+        if min != 0 {
+            return None;
+        } // reject 2.x where x != 0
         let mut c = Cursor::new(buf);
         c.set_position(8);
         let file_ref = c.read_u64::<LittleEndian>().ok()? as u128;
@@ -292,8 +296,9 @@ impl UsnRecord {
     }
 
     fn parse_v4(buf: &[u8], record_len: u32, maj: u16, min: u16) -> Option<Self> {
-        // Layout per USN_RECORD_V4 (no file name; has range-tracking extents)
-        // Header already read (4+2+2). Next:
+        if min != 0 {
+            return None;
+        }
         let mut c = Cursor::new(buf);
         c.set_position(8);
         let file_ref = read_u128(&mut c).ok()?;
@@ -511,7 +516,8 @@ fn looks_like_usn_header(buf: &[u8], pos: usize) -> bool {
         return false;
     }
     let maj = u16::from_le_bytes([buf[pos + 4], buf[pos + 5]]);
-    matches!(maj, 2 | 3 | 4)
+    let min = u16::from_le_bytes([buf[pos + 6], buf[pos + 7]]);
+    matches!((maj, min), (2, 0) | (3, 0) | (4, 0))
 }
 
 /// Parse a full `$J` stream into `UsnRecord`s (robust to padding/sparse).

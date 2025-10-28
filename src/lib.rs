@@ -94,6 +94,7 @@ impl<T: Read + Seek> NTFS<T> {
     }
 
     pub fn get_file_id(&mut self, file_id: u64) -> Result<MFTRecord, Box<dyn Error>> {
+        let file_id = file_id & 0x0000_FFFF_FFFF_FFFF;
         // Making sure we know where every extent of $MFT lives
         self.ensure_mft_runs()?;
         let runs = self.mft_runs.as_ref().unwrap();
