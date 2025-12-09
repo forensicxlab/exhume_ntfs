@@ -1,4 +1,4 @@
-use clap::{Arg, ArgAction, Command, value_parser};
+use clap::*;
 use clap_num::maybe_hex;
 use exhume_body::{Body, BodySlice};
 use exhume_ntfs::{NTFS, ReuseCheck};
@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 fn main() {
     let matches = Command::new("exhume_ntfs")
-        .version("0.1.9")
-        .author("ForensicXlab")
+        .version(crate_version!())
+        .author(crate_authors!())
         .about("Exhume the metadata from an Microsoft NTFS filesystem.")
         .arg(
             Arg::new("body")
