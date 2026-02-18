@@ -42,9 +42,25 @@ impl<T: Read + Seek> NTFS<T> {
                 body,
                 mft_runs: None,
             })
+        } else if pbs.is_bitlocker() {
+            error!(
+                "The partition is BitLocker-encrypted (OEM ID: -FVE-FS-). \
+                 NTFS metadata cannot be read without decryption."
+            );
+            Err(
+                "The partition is BitLocker-encrypted (OEM ID: -FVE-FS-). \
+                 NTFS metadata cannot be read without decryption."
+                    .into(),
+            )
         } else {
-            error!("The OEM Identifier is not valid.");
-            Err("The OEM Identifier is not valid.".into())
+            error!(
+                "The OEM Identifier is not valid (found: {:?}).",
+                String::from_utf8_lossy(&pbs.oem_id).trim()
+            );
+            Err(format!(
+                "The OEM Identifier is not valid (found: {:?}).",
+                String::from_utf8_lossy(&pbs.oem_id).trim()
+            ))
         }
     }
 

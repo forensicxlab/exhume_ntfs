@@ -49,6 +49,7 @@ pub struct PartitionBootSector {
 
 impl PartitionBootSector {
     pub const NTFS_OEM_ID: [u8; 8] = *b"NTFS    ";
+    pub const BITLOCKER_OEM_ID: [u8; 8] = *b"-FVE-FS-";
 
     /// Parse the 512-byte sector into `PartitionBootSector`
     pub fn from_bytes(buf: &[u8]) -> io::Result<Self> {
@@ -125,6 +126,14 @@ impl PartitionBootSector {
     /// Check if the oem_id is valid
     pub fn oem_id_is_valid(&self) -> bool {
         self.oem_id == Self::NTFS_OEM_ID
+    }
+
+    /// Check if the partition is BitLocker-encrypted.
+    ///
+    /// BitLocker replaces the NTFS OEM identifier with `-FVE-FS-` in the
+    /// volume boot sector.
+    pub fn is_bitlocker(&self) -> bool {
+        self.oem_id == Self::BITLOCKER_OEM_ID
     }
 
     /// Compute actual bytes per file-record segment
