@@ -7,7 +7,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use chrono::{TimeZone, Utc};
 use core::convert::TryFrom;
 use log::{debug, error, warn};
-use prettytable::{Table, row};
+use prettytable::{row, Table};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -266,22 +266,22 @@ impl MFTRecord {
             } else {
                 None
             }
-        }) {
-            if root.len() >= 0x0C {
+        })
+            && root.len() >= 0x0C {
                 let mut c = Cursor::new(root);
                 c.set_position(8);
-                if let Ok(sz) = c.read_u32::<LittleEndian>() {
-                    if sz.is_power_of_two() && sz >= 512 && sz <= 65_536 {
+                if let Ok(sz) = c.read_u32::<LittleEndian>()
+                    && sz.is_power_of_two() && (512..=65_536).contains(&sz) {
                         return sz;
                     }
-                }
             }
+            default
         }
-        default
     }
 
     /// Convert record to a human‑readable table string.
-    pub fn to_string(&self) -> String {
+impl std::fmt::Display for MFTRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut out = String::new();
 
         //  Header
@@ -406,10 +406,12 @@ impl MFTRecord {
             out.push_str(&t.to_string());
         }
 
-        out
+        write!(f, "{}", out)
     }
+}
 
     /// Serialize to JSON (uses `serde`).
+impl MFTRecord {
     pub fn to_json(&self) -> Value {
         json!({
             "header": &self.header,
@@ -608,7 +610,7 @@ impl TryFrom<u32> for AttributeType {
 
 pub fn filetime_to_local_datetime(ft: u64) -> String {
     let micros_since_1601 = ft / 10;
-    const DELTA_MICROS: i64 = 116_444_736_000_000_00;
+    const DELTA_MICROS: i64 = 11_644_473_600_000_000;
     let unix_micros = micros_since_1601 as i64 - DELTA_MICROS;
     let secs = unix_micros / 1_000_000;
     let nanos = (unix_micros % 1_000_000) * 1_000;

@@ -6,7 +6,7 @@
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use capstone::prelude::*;
-use prettytable::{Table, row};
+use prettytable::{row, Table};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, Cursor, Read};
@@ -165,8 +165,10 @@ impl PartitionBootSector {
     pub fn to_json(&self) -> Value {
         serde_json::to_value(self).unwrap_or_else(|_| json!({}))
     }
+}
 
-    pub fn to_string(&self) -> String {
+impl std::fmt::Display for PartitionBootSector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut table = Table::new();
 
         table.add_row(row!["Field", "Value"]);
@@ -214,8 +216,11 @@ impl PartitionBootSector {
             "End of sector marker",
             format!("{:04X}", self.end_of_sector_marker)
         ]);
-        table.to_string()
+        write!(f, "{}", table)
     }
+}
+
+impl PartitionBootSector {
 
     pub fn disassemble_bootstrap_code(&self) -> String {
         let cs = Capstone::new()

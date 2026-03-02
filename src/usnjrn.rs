@@ -8,7 +8,7 @@
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use chrono::{TimeZone, Utc};
-use prettytable::{Table, row};
+use prettytable::{row, Table};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -363,7 +363,7 @@ impl UsnRecord {
             return String::new();
         }
         let micros_since_1601 = ft / 10;
-        const DELTA_MICROS: i64 = 116_444_736_000_000_00;
+        const DELTA_MICROS: i64 = 11_644_473_600_000_000;
         let unix_micros = micros_since_1601 as i64 - DELTA_MICROS;
         let secs = unix_micros / 1_000_000;
         let nanos = (unix_micros % 1_000_000) * 1_000;
@@ -372,8 +372,10 @@ impl UsnRecord {
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_default()
     }
+}
 
-    pub fn to_string(&self) -> String {
+impl std::fmt::Display for UsnRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut t = Table::new();
         t.add_row(row![
             "USN Record Version",
@@ -417,14 +419,14 @@ impl UsnRecord {
                 t.add_row(row![b -> "RemainingExtents", rem]);
             }
         }
-        if let Some(rr) = &self.reused_records {
-            if !rr.is_empty() {
+        if let Some(rr) = &self.reused_records
+            && !rr.is_empty() {
                 let mut subtbl = prettytable::Table::new();
                 subtbl.add_row(row!["Index", "Current Seq", "Seen Seqs", "Reasons", "Name"]);
                 for e in rr {
                     subtbl.add_row(row![
                         e.index,
-                        e.current_seq.map_or("-".to_string(), |s| s.to_string()),
+                            e.current_seq.map_or("-".to_string(), |s| s.to_string()),
                         if e.seen_sequences.is_empty() {
                             "-".to_string()
                         } else {
@@ -445,10 +447,11 @@ impl UsnRecord {
                 // Add the sub-table as a single cell in the main table
                 t.add_row(row![b -> "Reused records", subtbl.to_string()]);
             }
-        }
-        t.to_string()
+        write!(f, "{}", t)
     }
+}
 
+impl UsnRecord {
     pub fn to_json(&self) -> Value {
         json!({
             "version": { "major": self.major_version, "minor": self.minor_version },
@@ -491,7 +494,7 @@ fn read_utf16_name(
         return Some(String::new());
     }
     if name_off == 0
-        || name_len % 2 != 0
+        || !name_len.is_multiple_of(2)
         || name_off + name_len > record_len
         || name_off + name_len > buf.len()
     {
@@ -512,7 +515,7 @@ fn looks_like_usn_header(buf: &[u8], pos: usize) -> bool {
         return false;
     }
     let rl = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
-    if rl < 60 || rl > (1 << 20) || rl % 8 != 0 || pos + rl > buf.len() {
+    if !(60..=(1 << 20)).contains(&rl) || !rl.is_multiple_of(8) || pos + rl > buf.len() {
         return false;
     }
     let maj = u16::from_le_bytes([buf[pos + 4], buf[pos + 5]]);

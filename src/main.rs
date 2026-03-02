@@ -161,11 +161,11 @@ fn main() {
     let show_dir_entry = matches.get_flag("dir_entry");
 
     // 1) Prepare the "body" and create an ExtFS instance.
-    let mut body = Body::new(file_path.to_owned(), format);
+    let body = Body::new(file_path.to_owned(), format);
     debug!("Created Body from '{}'", file_path);
 
     let partition_size = *size * body.get_sector_size() as u64;
-    let mut slice = match BodySlice::new(&mut body, *offset, partition_size) {
+    let mut slice = match BodySlice::new(&body, *offset, partition_size) {
         Ok(sl) => sl,
         Err(e) => {
             error!("Could not create BodySlice: {}", e);
@@ -188,7 +188,7 @@ fn main() {
                 Err(e) => error!("Error serializing PBS to JSON: {}", e),
             }
         } else {
-            println!("{}", filesystem.pbs.to_string());
+            println!("{}", filesystem.pbs);
         }
     }
 
@@ -215,7 +215,7 @@ fn main() {
                     println!("{}", serde_json::to_string_pretty(&j).unwrap());
                 } else {
                     for r in records {
-                        println!("{}", r.to_string());
+                        println!("{}", r);
                         println!();
                     }
                 }
@@ -242,7 +242,7 @@ fn main() {
             if json_output {
                 let arr: Vec<Value> = entries.iter().map(|de| {
                     // Trying to read ADS for each entry
-                    let ads_json = match filesystem.get_file_id(de.file_id as u64) {
+                    let ads_json = match filesystem.get_file_id(de.file_id) {
                         Ok(rec) => rec.alternate_data_streams().into_iter().map(|s| {
                             json!({"name": s.name, "size": s.size, "resident": s.resident, "attr_id": s.attr_id})
                         }).collect::<Vec<_>>(),
@@ -257,7 +257,7 @@ fn main() {
                     // base entry
                     println!("{}  {}", de.file_id, de.name);
 
-                    if let Ok(rec) = filesystem.get_file_id(de.file_id as u64) {
+                    if let Ok(rec) = filesystem.get_file_id(de.file_id) {
                         for s in rec.alternate_data_streams() {
                             println!("{}-{}  {}:{}", de.file_id, s.attr_id, de.name, s.name);
                         }
@@ -276,12 +276,10 @@ fn main() {
                 }
                 Err(e) => error!("Dump failed: {}", e),
             }
+        } else if json_output {
+            println!("{}", file.to_json())
         } else {
-            if json_output {
-                println!("{}", file.to_json())
-            } else {
-                println!("{}", file.to_string());
-            }
+            println!("{}", file);
         }
     }
 }

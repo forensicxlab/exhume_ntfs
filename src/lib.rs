@@ -47,11 +47,9 @@ impl<T: Read + Seek> NTFS<T> {
                 "The partition is BitLocker-encrypted (OEM ID: -FVE-FS-). \
                  NTFS metadata cannot be read without decryption."
             );
-            Err(
-                "The partition is BitLocker-encrypted (OEM ID: -FVE-FS-). \
+            Err("The partition is BitLocker-encrypted (OEM ID: -FVE-FS-). \
                  NTFS metadata cannot be read without decryption."
-                    .into(),
-            )
+                .into())
         } else {
             error!(
                 "The OEM Identifier is not valid (found: {:?}).",
@@ -103,7 +101,7 @@ impl<T: Read + Seek> NTFS<T> {
         self.ensure_mft_runs()?; // make sure we have the run‑list
         let runs = self.mft_runs.as_ref().unwrap();
 
-        let total_clusters: u64 = runs.iter().map(|(_, len)| *len as u64).sum();
+        let total_clusters: u64 = runs.iter().map(|(_, len)| *len).sum();
         let total_bytes = total_clusters * self.pbs.cluster_size() as u64;
 
         Ok(total_bytes / self.pbs.file_record_size() as u64)
@@ -128,15 +126,15 @@ impl<T: Read + Seek> NTFS<T> {
         let (lcn, _run_len) = runs
             .iter()
             .find(|(_, len)| {
-                let hit = vcn < base_vcn + *len as u64;
+                let hit = vcn < base_vcn + *len;
                 if !hit {
-                    base_vcn += *len as u64;
+                    base_vcn += *len;
                 }
                 hit
             })
             .ok_or("VCN out of range for $MFT")?;
 
-        let cluster_delta = (vcn - base_vcn) as u64;
+        let cluster_delta = vcn - base_vcn;
         let phys_off = (*lcn as u64) * clu_size + // start of the right extent
             cluster_delta   * clu_size + // inside that extent
             idx_in_clu      * rec_size; // inside the cluster
@@ -193,10 +191,10 @@ impl<T: Read + Seek> NTFS<T> {
                     let usn = [buf[usa_off], buf[usa_off + 1]];
 
                     for i in 1..usa_count {
-                        let fix_offset = usa_off + 2 * i as usize;
+                        let fix_offset = usa_off + 2 * i;
                         let fix = [buf[fix_offset], buf[fix_offset + 1]];
 
-                        let sec_end = i as usize * bytes_per_sec - 2;
+                        let sec_end = i * bytes_per_sec - 2;
 
                         if buf[sec_end] == usn[0] && buf[sec_end + 1] == usn[1] {
                             buf[sec_end] = fix[0];
@@ -268,7 +266,7 @@ impl<T: Read + Seek> NTFS<T> {
                     let byte_len = len as usize * cluster_size;
 
                     if lcn < 0 {
-                        out.extend(std::iter::repeat(0u8).take(byte_len)); // sparse
+                        out.extend(std::iter::repeat_n(0u8, byte_len)); // sparse
                     } else {
                         let off = lcn as u64 * cluster_size as u64;
                         self.body.seek(SeekFrom::Start(off))?;
@@ -439,7 +437,7 @@ impl<T: Read + Seek> NTFS<T> {
                     let byte_len = len as usize * cluster_size;
 
                     if lcn < 0 {
-                        out.extend(std::iter::repeat(0u8).take(byte_len)); // sparse
+                        out.extend(std::iter::repeat_n(0u8, byte_len)); // sparse
                     } else {
                         let off = lcn as u64 * cluster_size as u64;
                         self.body.seek(SeekFrom::Start(off))?;
@@ -534,11 +532,10 @@ impl<T: Read + Seek> NTFS<T> {
                 Err(_) => break,
             };
 
-            if let Some(name) = rec.primary_name() {
-                if !name.is_empty() && name != "." && name != ".." {
+            if let Some(name) = rec.primary_name()
+                && !name.is_empty() && name != "." && name != ".." {
                     parts.push(name);
                 }
-            }
 
             match rec.parent_file_id() {
                 Some(pid) if pid != parent_id => parent_id = pid,
@@ -631,8 +628,8 @@ impl<T: Read + Seek> NTFS<T> {
                               cur_seq: Option<u16>| {
             let mut rs = reasons;
             let mut seen = Vec::<u16>::new();
-            if let Some(s) = journal_seqs {
-                if s.len() > 1 {
+            if let Some(s) = journal_seqs
+                && s.len() > 1 {
                     if !rs
                         .iter()
                         .any(|r| matches!(r, ReuseReason::MultipleSequencesInJournal))
@@ -643,7 +640,6 @@ impl<T: Read + Seek> NTFS<T> {
                     seen.sort_unstable();
                     seen.dedup();
                 }
-            }
             if !rs.is_empty() {
                 reused.push(ReusedElement {
                     index,
@@ -659,11 +655,10 @@ impl<T: Read + Seek> NTFS<T> {
         let file_idx = r.file_ref_u64();
         let file_cur_seq = self.current_mft_seq(file_idx);
         let mut file_reasons = Vec::new();
-        if let Some(cur) = file_cur_seq {
-            if cur != r.file_ref_seq() {
+        if let Some(cur) = file_cur_seq
+            && cur != r.file_ref_seq() {
                 file_reasons.push(ReuseReason::CurrentSeqDiffersFromUsn);
             }
-        }
         let file_journal_seqs = reuse_index.get(&file_idx);
         maybe_push(
             file_idx,
@@ -677,11 +672,10 @@ impl<T: Read + Seek> NTFS<T> {
         let parent_idx = r.parent_ref_u64();
         let parent_cur_seq = self.current_mft_seq(parent_idx);
         let mut parent_reasons = Vec::new();
-        if let Some(cur) = parent_cur_seq {
-            if cur != r.parent_ref_seq() {
+        if let Some(cur) = parent_cur_seq
+            && cur != r.parent_ref_seq() {
                 parent_reasons.push(ReuseReason::CurrentSeqDiffersFromUsn);
             }
-        }
         // Name for the immediate parent (try current MFT)
         let parent_name = self
             .get_file_id(parent_idx)
@@ -727,11 +721,10 @@ impl<T: Read + Seek> NTFS<T> {
         }
         // For each ancestor (excluding immediate parent—we already did it), push if journal says reused
         for (idx, name) in chain_names.into_iter().skip(1) {
-            if let Some(seqs) = reuse_index.get(&idx) {
-                if seqs.len() > 1 {
+            if let Some(seqs) = reuse_index.get(&idx)
+                && seqs.len() > 1 {
                     maybe_push(idx, name, Some(seqs), vec![], self.current_mft_seq(idx));
                 }
-            }
         }
 
         if !reused.is_empty() {
