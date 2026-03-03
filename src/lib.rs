@@ -15,6 +15,7 @@ use usnjrn::{ReuseReason, ReusedElement, UsnRecord};
 pub mod mft;
 pub mod pbs;
 pub mod usnjrn;
+pub mod bitlocker;
 
 #[derive(Clone, Copy, Debug)]
 pub enum ReuseCheck {

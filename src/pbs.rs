@@ -143,7 +143,8 @@ impl PartitionBootSector {
                 * self.sectors_per_cluster as u32
                 * self.bytes_per_sector as u32
         } else {
-            1u32 << (-self.clusters_per_file_record as u32)
+            let shift = (self.clusters_per_file_record as i32).unsigned_abs();
+            1u32.checked_shl(shift).unwrap_or(0)
         }
     }
 

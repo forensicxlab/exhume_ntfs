@@ -1,9 +1,11 @@
 use clap::*;
 use clap_num::maybe_hex;
 use exhume_body::{Body, BodySlice};
-use exhume_ntfs::{NTFS, ReuseCheck};
+use exhume_ntfs::{NTFS, ReuseCheck, bitlocker::BitLockerStream};
 use log::{debug, error};
 use serde_json::{Value, json};
+use std::io::{Read, Seek};
+use std::str::FromStr;
 
 fn main() {
     let matches = Command::new("exhume_ntfs")
@@ -113,6 +115,12 @@ fn main() {
                 .help("Output certain structures (pbs, file, mft) in JSON format."),
         )
         .arg(
+            Arg::new("fvek")
+                .long("fvek")
+                .value_parser(value_parser!(String))
+                .help("Provide the Full Volume Encryption Key (FVEK) in hex to decrypt a BitLocker volume."),
+        )
+        .arg(
             Arg::new("log_level")
                 .short('l')
                 .long("log-level")
@@ -139,6 +147,58 @@ fn main() {
     let format = matches.get_one::<String>("format").unwrap_or(&auto);
     let offset = matches.get_one::<u64>("offset").unwrap();
     let size = matches.get_one::<u64>("size").unwrap();
+    let fvek_hex = matches.get_one::<String>("fvek");
+
+    // 1) Prepare the "body" and create an ExtFS instance.
+    let body = Body::new(file_path.to_owned(), format);
+    debug!("Created Body from '{}'", file_path);
+
+    let partition_size = *size * body.get_sector_size() as u64;
+    let mut slice = match BodySlice::new(&body, *offset, partition_size) {
+        Ok(sl) => sl,
+        Err(e) => {
+            error!("Could not create BodySlice: {}", e);
+            return;
+        }
+    };
+
+    if let Some(fvek_str) = fvek_hex {
+        let fvek_bytes = match hex::decode(fvek_str) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Invalid FVEK hex: {}", e);
+                return;
+            }
+        };
+        debug!("Initializing BitLocker stream with FVEK");
+        let mut bl_stream = match BitLockerStream::new(slice, &fvek_bytes, body.get_sector_size() as u64) {
+             Ok(s) => s,
+             Err(e) => {
+                 error!("Could not create BitLocker stream: {}", e);
+                 return;
+             }
+        };
+        let mut filesystem = match NTFS::new(&mut bl_stream) {
+            Ok(fs) => fs,
+            Err(e) => {
+                error!("Couldn't open NTFS (BitLocker decrypted): {}", e);
+                return;
+            }
+        };
+        run_exhume(&mut filesystem, &matches);
+    } else {
+        let mut filesystem = match NTFS::new(&mut slice) {
+            Ok(fs) => fs,
+            Err(e) => {
+                error!("Couldn't open NTFS: {}", e);
+                return;
+            }
+        };
+        run_exhume(&mut filesystem, &matches);
+    }
+}
+
+fn run_exhume<T: Read + Seek>(filesystem: &mut NTFS<T>, matches: &ArgMatches) {
     let show_pbs = matches.get_flag("pbs");
     let show_usn = matches.get_flag("usnjrnl");
     let reuse_mode_str = matches
@@ -160,26 +220,6 @@ fn main() {
     let file_id = matches.get_one::<usize>("file_id").copied().unwrap_or(0);
     let show_dir_entry = matches.get_flag("dir_entry");
 
-    // 1) Prepare the "body" and create an ExtFS instance.
-    let body = Body::new(file_path.to_owned(), format);
-    debug!("Created Body from '{}'", file_path);
-
-    let partition_size = *size * body.get_sector_size() as u64;
-    let mut slice = match BodySlice::new(&body, *offset, partition_size) {
-        Ok(sl) => sl,
-        Err(e) => {
-            error!("Could not create BodySlice: {}", e);
-            return;
-        }
-    };
-
-    let mut filesystem = match NTFS::new(&mut slice) {
-        Ok(fs) => fs,
-        Err(e) => {
-            error!("Couldn't open NTFS: {}", e);
-            return;
-        }
-    };
 
     if show_pbs {
         if json_output {
