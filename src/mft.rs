@@ -291,6 +291,32 @@ impl MFTRecord {
             _ => None,
         })
     }
+
+    /// Return decoded raw OneDrive reparse element payloads for cloud tags.
+    pub fn onedrive_reparse_elements_raw(&self) -> Option<Vec<OneDriveReparseElementBlob>> {
+        self.attributes.iter().find_map(|a| match a {
+            Attribute::Resident { header, value, .. }
+                if header.attr_type == AttributeType::ReparsePoint =>
+            {
+                if value.len() < 8 {
+                    return None;
+                }
+                let mut cur = Cursor::new(value.as_slice());
+                let tag = cur.read_u32::<LittleEndian>().ok()?;
+                let data_len = cur.read_u16::<LittleEndian>().ok()? as usize;
+                let _reserved = cur.read_u16::<LittleEndian>().ok()?;
+                if !is_cloud_reparse_tag(tag) {
+                    return None;
+                }
+                let payload_end = 8usize.saturating_add(data_len).min(value.len());
+                if payload_end < 8 {
+                    return Some(Vec::new());
+                }
+                Some(parse_onedrive_reparse_element_blobs(&value[8..payload_end]))
+            }
+            _ => None,
+        })
+    }
 }
 
 /// Convert record to a human‑readable table string.
@@ -453,6 +479,7 @@ impl std::fmt::Display for MFTRecord {
                 if !od.elements.is_empty() {
                     for (idx, elem) in od.elements.iter().take(8).enumerate() {
                         let mut parts = vec![
+                            format!("name={}", elem.element_name),
                             format!("type=0x{:04X}", elem.element_type),
                             format!("len={}", elem.length),
                             format!("off=0x{:X}", elem.offset),
@@ -470,6 +497,9 @@ impl std::fmt::Display for MFTRecord {
                         }
                         if let Some(v) = &elem.value_utf16 {
                             parts.push(format!("utf16=\"{}\"", v));
+                        }
+                        if let Some(v) = &elem.nested_magic {
+                            parts.push(format!("nested_magic={}", v));
                         }
                         if let Some(v) = &elem.value_hex {
                             parts.push(format!("hex={}", v));
@@ -734,6 +764,7 @@ pub struct OneDriveReparseInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OneDriveReparseElement {
+    pub element_name: String,
     pub element_type: u16,
     pub length: u16,
     pub offset: u32,
@@ -742,6 +773,18 @@ pub struct OneDriveReparseElement {
     pub value_u32: Option<u32>,
     pub value_u64: Option<u64>,
     pub value_utf16: Option<String>,
+    pub nested_magic: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OneDriveReparseElementBlob {
+    pub index: usize,
+    pub element_name: String,
+    pub element_type: u16,
+    pub length: u16,
+    pub offset: u32,
+    pub in_bounds: bool,
+    pub data: Vec<u8>,
 }
 
 impl ReparsePointAttr {
@@ -851,40 +894,89 @@ fn parse_onedrive_reparse(payload: &[u8], tag: u32) -> OneDriveReparseInfo {
     };
 
     let flattened = flatten_printable_ascii(payload);
+    let utf16_strings = extract_utf16_strings(payload);
     if let Some(guid) = find_guid_token(&flattened) {
         info.cid = Some(guid);
         info.account_type = Some("OneDrive Business".to_string());
     } else if let Some(personal_cid) = find_personal_cid_token(&flattened) {
         info.cid = Some(personal_cid);
         info.account_type = Some("OneDrive Personal".to_string());
+    } else if let Some(inferred) =
+        infer_account_type_from_syncroot_hints(&flattened, &utf16_strings)
+    {
+        info.account_type = Some(inferred);
     } else {
         info.account_type = Some("Unknown".to_string());
     }
 
-    if payload.len() < 20 {
-        return info;
+    if payload.len() >= 20 {
+        let outer_flags = u16::from_le_bytes([payload[0], payload[1]]);
+        let outer_length = u16::from_le_bytes([payload[2], payload[3]]);
+        let magic_u32 = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        let crc32 = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
+        let file_data_length =
+            u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
+        let file_data_flags = u16::from_le_bytes([payload[16], payload[17]]);
+        let element_count = u16::from_le_bytes([payload[18], payload[19]]);
+
+        info.outer_flags = Some(outer_flags);
+        info.outer_length = Some(outer_length);
+        info.magic = magic_u32
+            .to_le_bytes()
+            .iter()
+            .all(|b| b.is_ascii_graphic())
+            .then(|| String::from_utf8_lossy(&magic_u32.to_le_bytes()).to_string());
+        info.crc32 = Some(crc32);
+        info.file_data_length = Some(file_data_length);
+        info.file_data_flags = Some(file_data_flags);
+        info.element_count = Some(element_count);
     }
 
-    let outer_flags = u16::from_le_bytes([payload[0], payload[1]]);
-    let outer_length = u16::from_le_bytes([payload[2], payload[3]]);
-    let magic_u32 = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-    let crc32 = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
-    let file_data_length = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
-    let file_data_flags = u16::from_le_bytes([payload[16], payload[17]]);
+    for blob in parse_onedrive_reparse_element_blobs(payload) {
+        let value = blob.data.as_slice();
+        let value_hex = if blob.in_bounds {
+            let preview_len = value.len().min(64);
+            let mut out = hex::encode(&value[..preview_len]);
+            if value.len() > preview_len {
+                out.push_str("...");
+            }
+            Some(out)
+        } else {
+            None
+        };
+        let value_u32 = (blob.in_bounds && value.len() >= 4)
+            .then(|| u32::from_le_bytes([value[0], value[1], value[2], value[3]]));
+        let value_u64 = (blob.in_bounds && value.len() >= 8).then(|| {
+            u64::from_le_bytes([
+                value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+            ])
+        });
+        let value_utf16 = decode_utf16_value_preview(value);
+        let nested_magic = detect_reparse_magic(value);
+
+        info.elements.push(OneDriveReparseElement {
+            element_name: blob.element_name,
+            element_type: blob.element_type,
+            length: blob.length,
+            offset: blob.offset,
+            in_bounds: blob.in_bounds,
+            value_hex,
+            value_u32,
+            value_u64,
+            value_utf16,
+            nested_magic,
+        });
+    }
+
+    info
+}
+
+fn parse_onedrive_reparse_element_blobs(payload: &[u8]) -> Vec<OneDriveReparseElementBlob> {
+    let mut out = Vec::new();
+    if payload.len() < 20 {
+        return out;
+    }
     let element_count = u16::from_le_bytes([payload[18], payload[19]]);
-
-    info.outer_flags = Some(outer_flags);
-    info.outer_length = Some(outer_length);
-    info.magic = magic_u32
-        .to_le_bytes()
-        .iter()
-        .all(|b| b.is_ascii_graphic())
-        .then(|| String::from_utf8_lossy(&magic_u32.to_le_bytes()).to_string());
-    info.crc32 = Some(crc32);
-    info.file_data_length = Some(file_data_length);
-    info.file_data_flags = Some(file_data_flags);
-    info.element_count = Some(element_count);
-
     let capped_count = usize::from(element_count).min(256);
     let desc_start = 20usize;
     let max_desc_count = payload.len().saturating_sub(desc_start) / 8;
@@ -908,46 +1000,24 @@ fn parse_onedrive_reparse(payload: &[u8], tag: u32) -> OneDriveReparseInfo {
         let element_start = 4usize.saturating_add(offset as usize);
         let element_end = element_start.saturating_add(length as usize);
         let in_bounds = element_end <= payload.len();
-        let value = if in_bounds {
-            &payload[element_start..element_end]
+        let data = if in_bounds {
+            payload[element_start..element_end].to_vec()
         } else {
-            &[]
+            Vec::new()
         };
-        let value_hex = if in_bounds {
-            let preview_len = value.len().min(64);
-            let mut out = hex::encode(&value[..preview_len]);
-            if value.len() > preview_len {
-                out.push_str("...");
-            }
-            Some(out)
-        } else {
-            None
-        };
-        let value_u32 = (in_bounds && value.len() >= 4)
-            .then(|| u32::from_le_bytes([value[0], value[1], value[2], value[3]]));
-        let value_u64 = (in_bounds && value.len() >= 8).then(|| {
-            u64::from_le_bytes([
-                value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
-            ])
-        });
-        let value_utf16 = (in_bounds && value.len() >= 2 && value.len().is_multiple_of(2))
-            .then(|| decode_utf16(value))
-            .flatten()
-            .filter(|s| !s.trim_matches(char::from(0)).is_empty());
 
-        info.elements.push(OneDriveReparseElement {
+        out.push(OneDriveReparseElementBlob {
+            index: i,
+            element_name: onedrive_element_type_name(element_type).to_string(),
             element_type,
             length,
             offset,
             in_bounds,
-            value_hex,
-            value_u32,
-            value_u64,
-            value_utf16,
+            data,
         });
     }
 
-    info
+    out
 }
 
 fn flatten_printable_ascii(raw: &[u8]) -> String {
@@ -955,6 +1025,107 @@ fn flatten_printable_ascii(raw: &[u8]) -> String {
         .filter(|b| b.is_ascii_graphic())
         .map(|b| *b as char)
         .collect()
+}
+
+fn onedrive_element_type_name(element_type: u16) -> &'static str {
+    match element_type {
+        0x0006 => "U64",
+        0x0007 => "U8/BOOL",
+        0x000A => "U32",
+        0x0011 => "BLOB/NESTED_REPARSE",
+        _ => "UNKNOWN",
+    }
+}
+
+fn detect_reparse_magic(value: &[u8]) -> Option<String> {
+    if value.len() < 4 {
+        return None;
+    }
+    let magic = [value[0], value[1], value[2], value[3]];
+    let s = String::from_utf8_lossy(&magic);
+    (s == "FeRp" || s == "BtRp").then(|| s.to_string())
+}
+
+fn decode_utf16_value_preview(value: &[u8]) -> Option<String> {
+    if value.len() < 6 || !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let s = decode_utf16(value)?;
+    let trimmed = s.trim_matches(char::from(0)).to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let printable = trimmed
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\t' || *c == '\n' || *c == '\r')
+        .count();
+    if printable * 100 / trimmed.chars().count().max(1) < 80 {
+        return None;
+    }
+    Some(trimmed)
+}
+
+fn extract_utf16_strings(raw: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    if raw.len() < 8 {
+        return out;
+    }
+    let mut cur: Vec<u16> = Vec::new();
+    for chunk in raw.chunks_exact(2) {
+        let u = u16::from_le_bytes([chunk[0], chunk[1]]);
+        if u == 0 {
+            if cur.len() >= 4
+                && let Ok(s) = String::from_utf16(&cur)
+            {
+                let trimmed = s.trim().to_string();
+                if trimmed.chars().any(|c| c.is_ascii_alphabetic()) {
+                    out.push(trimmed);
+                }
+            }
+            cur.clear();
+            continue;
+        }
+        cur.push(u);
+    }
+    if cur.len() >= 4
+        && let Ok(s) = String::from_utf16(&cur)
+    {
+        let trimmed = s.trim().to_string();
+        if trimmed.chars().any(|c| c.is_ascii_alphabetic()) {
+            out.push(trimmed);
+        }
+    }
+    out
+}
+
+fn infer_account_type_from_syncroot_hints(
+    flattened_ascii: &str,
+    utf16_strings: &[String],
+) -> Option<String> {
+    for s in utf16_strings {
+        let lower = s.to_ascii_lowercase();
+        if lower.contains("onedrive - ")
+            || lower.contains("sharepoint")
+            || lower.contains("business")
+        {
+            return Some("OneDrive Business".to_string());
+        }
+        if lower.contains("\\onedrive\\")
+            || lower.ends_with("\\onedrive")
+            || lower.contains("personal")
+        {
+            return Some("OneDrive Personal".to_string());
+        }
+    }
+
+    let l = flattened_ascii.to_ascii_lowercase();
+    if l.contains("onedrive-") || l.contains("business") {
+        return Some("OneDrive Business".to_string());
+    }
+    if l.contains("personal") {
+        return Some("OneDrive Personal".to_string());
+    }
+    None
 }
 
 fn is_ascii_hex(b: u8) -> bool {
@@ -1338,7 +1509,8 @@ pub fn parse_index_root(raw: &[u8]) -> Option<Vec<DirectoryEntry>> {
 mod tests {
     use super::{
         REPARSE_TAG_CLOUD_7, ReparsePointAttr, find_guid_token, find_personal_cid_token,
-        parse_onedrive_reparse,
+        infer_account_type_from_syncroot_hints, parse_onedrive_reparse,
+        parse_onedrive_reparse_element_blobs,
     };
 
     #[test]
@@ -1370,13 +1542,16 @@ mod tests {
         assert_eq!(od.file_data_flags, Some(2));
         assert_eq!(od.element_count, Some(10));
         assert_eq!(od.elements.len(), 2);
+        assert_eq!(od.elements[0].element_name, "U8/BOOL");
         assert_eq!(od.elements[0].element_type, 7);
         assert_eq!(od.elements[0].length, 1);
         assert_eq!(od.elements[0].offset, 96);
+        assert_eq!(od.elements[1].element_name, "U32");
         assert_eq!(od.elements[1].element_type, 10);
         assert_eq!(od.elements[1].length, 4);
         assert_eq!(od.elements[1].offset, 100);
         assert_eq!(od.elements[1].value_u32, Some(118));
+        assert!(od.elements[1].value_utf16.is_none());
     }
 
     #[test]
@@ -1400,5 +1575,36 @@ mod tests {
             info.cid.as_deref(),
             Some("71f3922d-b05e-42f6-a7d5-5f2605843eca")
         );
+    }
+
+    #[test]
+    fn infer_account_from_syncroot_hints() {
+        let utf16_strings = vec![
+            r"\Users\alice\OneDrive - Contoso\docs".to_string(),
+            "SyncRootIdentity".to_string(),
+        ];
+        assert_eq!(
+            infer_account_type_from_syncroot_hints("", &utf16_strings).as_deref(),
+            Some("OneDrive Business")
+        );
+    }
+
+    #[test]
+    fn parse_raw_element_blobs() {
+        let mut payload: Vec<u8> = vec![
+            0x01, 0x00, 0x6C, 0x00, 0x46, 0x65, 0x52, 0x70, 0xED, 0x47, 0xD0, 0x1A, 0x68, 0x00,
+            0x00, 0x00, 0x02, 0x00, 0x0A, 0x00, 0x07, 0x00, 0x01, 0x00, 0x60, 0x00, 0x00, 0x00,
+            0x0A, 0x00, 0x04, 0x00, 0x64, 0x00, 0x00, 0x00,
+        ];
+        payload.resize(108, 0);
+        payload[100] = 1;
+        payload[104] = 118;
+
+        let blobs = parse_onedrive_reparse_element_blobs(&payload);
+        assert_eq!(blobs.len(), 2);
+        assert_eq!(blobs[0].element_name, "U8/BOOL");
+        assert_eq!(blobs[0].data, vec![1u8]);
+        assert_eq!(blobs[1].element_name, "U32");
+        assert_eq!(blobs[1].data, vec![118u8, 0, 0, 0]);
     }
 }

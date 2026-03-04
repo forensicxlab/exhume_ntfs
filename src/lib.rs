@@ -12,10 +12,10 @@ use std::error::Error;
 use std::io::{Read, Seek, SeekFrom};
 use usnjrn::{ReuseReason, ReusedElement, UsnRecord};
 
+pub mod bitlocker;
 pub mod mft;
 pub mod pbs;
 pub mod usnjrn;
-pub mod bitlocker;
 
 #[derive(Clone, Copy, Debug)]
 pub enum ReuseCheck {
@@ -500,6 +500,57 @@ impl<T: Read + Seek> NTFS<T> {
         Ok(recs)
     }
 
+    /// Build a full NTFS path (e.g., `\Users\alice\OneDrive\foo.txt`) from a file MFT id.
+    pub fn build_full_path_from_file_id(&mut self, file_id: u64) -> Option<String> {
+        let rec = self.get_file_id(file_id).ok()?;
+        let name = rec.primary_name()?;
+        let parent = rec.parent_file_id()?;
+        let parent_path = self.build_parent_path_from_parent_ref(parent)?;
+        Some(join_parent_and_name(&parent_path, &name))
+    }
+
+    /// Infer OneDrive account type from current NTFS path context.
+    /// Returns `(account_type, hint)` when a clear signal exists.
+    pub fn infer_onedrive_account_type_from_path(
+        &mut self,
+        file_id: u64,
+    ) -> Option<(String, String)> {
+        let full_path = self.build_full_path_from_file_id(file_id)?;
+        let comps = full_path
+            .split('\\')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+
+        for c in comps {
+            let lower = c.to_ascii_lowercase();
+            if lower.starts_with("onedrive - ") {
+                return Some((
+                    "OneDrive Business".to_string(),
+                    format!("path component '{}'", c),
+                ));
+            }
+            if lower == "onedrive" {
+                return Some((
+                    "OneDrive Personal".to_string(),
+                    format!("path component '{}'", c),
+                ));
+            }
+            if lower.starts_with("onedrive") && lower.contains("personal") {
+                return Some((
+                    "OneDrive Personal".to_string(),
+                    format!("path component '{}'", c),
+                ));
+            }
+            if lower.starts_with("onedrive") && lower.contains('-') {
+                return Some((
+                    "OneDrive Business".to_string(),
+                    format!("path component '{}'", c),
+                ));
+            }
+        }
+        None
+    }
+
     /// Build a full NTFS path (e.g., `\Windows\System32`) starting from a **directory** MFT id.
     /// This follows the *parent* links only. It does not append a filename.
     fn build_parent_path_from_parent_ref(&mut self, mut parent_id: u64) -> Option<String> {
@@ -534,9 +585,12 @@ impl<T: Read + Seek> NTFS<T> {
             };
 
             if let Some(name) = rec.primary_name()
-                && !name.is_empty() && name != "." && name != ".." {
-                    parts.push(name);
-                }
+                && !name.is_empty()
+                && name != "."
+                && name != ".."
+            {
+                parts.push(name);
+            }
 
             match rec.parent_file_id() {
                 Some(pid) if pid != parent_id => parent_id = pid,
@@ -630,17 +684,18 @@ impl<T: Read + Seek> NTFS<T> {
             let mut rs = reasons;
             let mut seen = Vec::<u16>::new();
             if let Some(s) = journal_seqs
-                && s.len() > 1 {
-                    if !rs
-                        .iter()
-                        .any(|r| matches!(r, ReuseReason::MultipleSequencesInJournal))
-                    {
-                        rs.push(ReuseReason::MultipleSequencesInJournal);
-                    }
-                    seen.extend(s.iter().copied());
-                    seen.sort_unstable();
-                    seen.dedup();
+                && s.len() > 1
+            {
+                if !rs
+                    .iter()
+                    .any(|r| matches!(r, ReuseReason::MultipleSequencesInJournal))
+                {
+                    rs.push(ReuseReason::MultipleSequencesInJournal);
                 }
+                seen.extend(s.iter().copied());
+                seen.sort_unstable();
+                seen.dedup();
+            }
             if !rs.is_empty() {
                 reused.push(ReusedElement {
                     index,
@@ -657,9 +712,10 @@ impl<T: Read + Seek> NTFS<T> {
         let file_cur_seq = self.current_mft_seq(file_idx);
         let mut file_reasons = Vec::new();
         if let Some(cur) = file_cur_seq
-            && cur != r.file_ref_seq() {
-                file_reasons.push(ReuseReason::CurrentSeqDiffersFromUsn);
-            }
+            && cur != r.file_ref_seq()
+        {
+            file_reasons.push(ReuseReason::CurrentSeqDiffersFromUsn);
+        }
         let file_journal_seqs = reuse_index.get(&file_idx);
         maybe_push(
             file_idx,
@@ -674,9 +730,10 @@ impl<T: Read + Seek> NTFS<T> {
         let parent_cur_seq = self.current_mft_seq(parent_idx);
         let mut parent_reasons = Vec::new();
         if let Some(cur) = parent_cur_seq
-            && cur != r.parent_ref_seq() {
-                parent_reasons.push(ReuseReason::CurrentSeqDiffersFromUsn);
-            }
+            && cur != r.parent_ref_seq()
+        {
+            parent_reasons.push(ReuseReason::CurrentSeqDiffersFromUsn);
+        }
         // Name for the immediate parent (try current MFT)
         let parent_name = self
             .get_file_id(parent_idx)
@@ -723,9 +780,10 @@ impl<T: Read + Seek> NTFS<T> {
         // For each ancestor (excluding immediate parent—we already did it), push if journal says reused
         for (idx, name) in chain_names.into_iter().skip(1) {
             if let Some(seqs) = reuse_index.get(&idx)
-                && seqs.len() > 1 {
-                    maybe_push(idx, name, Some(seqs), vec![], self.current_mft_seq(idx));
-                }
+                && seqs.len() > 1
+            {
+                maybe_push(idx, name, Some(seqs), vec![], self.current_mft_seq(idx));
+            }
         }
 
         if !reused.is_empty() {

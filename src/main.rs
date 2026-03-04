@@ -5,7 +5,7 @@ use exhume_ntfs::{NTFS, ReuseCheck, bitlocker::BitLockerStream};
 use log::{debug, error};
 use serde_json::{Value, json};
 use std::io::{Read, Seek};
-
+use std::path::PathBuf;
 
 fn main() {
     let matches = Command::new("exhume_ntfs")
@@ -108,6 +108,20 @@ fn main() {
                 .help("Dump the file content to file_<ID>.bin (requires --file)"),
         )
         .arg(
+            Arg::new("dump_reparse_elements")
+                .long("dump-reparse-elements")
+                .action(ArgAction::SetTrue)
+                .requires("file_id")
+                .help("Dump OneDrive reparse element payloads to binary files."),
+        )
+        .arg(
+            Arg::new("dump_reparse_elements_dir")
+                .long("dump-reparse-elements-dir")
+                .value_parser(value_parser!(String))
+                .requires("dump_reparse_elements")
+                .help("Output directory for --dump-reparse-elements (default: current directory)."),
+        )
+        .arg(
             Arg::new("json")
                 .short('j')
                 .long("json")
@@ -171,13 +185,14 @@ fn main() {
             }
         };
         debug!("Initializing BitLocker stream with FVEK");
-        let mut bl_stream = match BitLockerStream::new(slice, &fvek_bytes, body.get_sector_size() as u64) {
-             Ok(s) => s,
-             Err(e) => {
-                 error!("Could not create BitLocker stream: {}", e);
-                 return;
-             }
-        };
+        let mut bl_stream =
+            match BitLockerStream::new(slice, &fvek_bytes, body.get_sector_size() as u64) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Could not create BitLocker stream: {}", e);
+                    return;
+                }
+            };
         let mut filesystem = match NTFS::new(&mut bl_stream) {
             Ok(fs) => fs,
             Err(e) => {
@@ -216,10 +231,14 @@ fn run_exhume<T: Read + Seek>(filesystem: &mut NTFS<T>, matches: &ArgMatches) {
     let usn_match_parent = matches.get_flag("match_parent");
     let show_bootstrap = matches.get_flag("bootstrap");
     let dump_file = matches.get_flag("dump");
+    let dump_reparse_elements = matches.get_flag("dump_reparse_elements");
+    let dump_reparse_elements_dir = matches
+        .get_one::<String>("dump_reparse_elements_dir")
+        .map(std::string::String::as_str)
+        .unwrap_or(".");
     let json_output = matches.get_flag("json");
     let file_id = matches.get_one::<usize>("file_id").copied().unwrap_or(0);
     let show_dir_entry = matches.get_flag("dir_entry");
-
 
     if show_pbs {
         if json_output {
@@ -273,6 +292,11 @@ fn run_exhume<T: Read + Seek>(filesystem: &mut NTFS<T>, matches: &ArgMatches) {
 
     if file_id > 0 {
         let file = filesystem.get_file_id(file_id as u64).unwrap();
+        let onedrive_path_inference = file
+            .reparse_point()
+            .and_then(|rp| rp.onedrive)
+            .filter(|od| od.account_type.as_deref() == Some("Unknown"))
+            .and_then(|_| filesystem.infer_onedrive_account_type_from_path(file_id as u64));
 
         if show_dir_entry {
             let entries = filesystem
@@ -316,10 +340,102 @@ fn run_exhume<T: Read + Seek>(filesystem: &mut NTFS<T>, matches: &ArgMatches) {
                 }
                 Err(e) => error!("Dump failed: {}", e),
             }
+        } else if dump_reparse_elements {
+            let out_dir = PathBuf::from(dump_reparse_elements_dir);
+            if let Err(e) = std::fs::create_dir_all(&out_dir) {
+                error!(
+                    "Cannot create dump output directory '{}': {}",
+                    out_dir.display(),
+                    e
+                );
+                return;
+            }
+            match file.onedrive_reparse_elements_raw() {
+                Some(elements) if !elements.is_empty() => {
+                    for elem in elements {
+                        let safe_name = sanitize_filename_component(&elem.element_name);
+                        let file_name = format!(
+                            "reparse_{:X}_elem_{}_{}_type_{:04X}.bin",
+                            file_id, elem.index, safe_name, elem.element_type
+                        );
+                        let out_path = out_dir.join(file_name);
+                        if let Err(e) = std::fs::write(&out_path, &elem.data) {
+                            error!(
+                                "Cannot write element #{} dump file '{}': {}",
+                                elem.index,
+                                out_path.display(),
+                                e
+                            );
+                            continue;
+                        }
+                        println!(
+                            "Dumped element #{} ({} / type 0x{:04X}, len={}, in_bounds={}) to {}",
+                            elem.index,
+                            elem.element_name,
+                            elem.element_type,
+                            elem.length,
+                            elem.in_bounds,
+                            out_path.display()
+                        );
+                    }
+                }
+                Some(_) => {
+                    println!(
+                        "No OneDrive reparse elements found to dump for file {}.",
+                        file_id
+                    );
+                }
+                None => {
+                    error!(
+                        "File {} is not a OneDrive cloud reparse point or contains no parsable payload.",
+                        file_id
+                    );
+                }
+            }
         } else if json_output {
-            println!("{}", file.to_json())
+            let mut j = file.to_json();
+            if let Some((account_type, hint)) = onedrive_path_inference
+                && let Some(obj) = j.as_object_mut()
+            {
+                obj.insert(
+                    "onedrive_account_inferred".to_string(),
+                    json!({
+                        "account_type": account_type,
+                        "source": "path_context",
+                        "hint": hint
+                    }),
+                );
+            }
+            match serde_json::to_string_pretty(&j) {
+                Ok(s) => println!("{}", s),
+                Err(_) => println!("{}", j),
+            }
         } else {
             println!("{}", file);
+            if let Some((account_type, hint)) = onedrive_path_inference {
+                println!();
+                println!("OneDrive Account Type (inferred): {}", account_type);
+                println!("Inference Source: path_context ({})", hint);
+                if let Some(path) = filesystem.build_full_path_from_file_id(file_id as u64) {
+                    println!("Path Context: {}", path);
+                }
+            }
         }
+    }
+}
+
+fn sanitize_filename_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "element".to_string()
+    } else {
+        out
     }
 }
