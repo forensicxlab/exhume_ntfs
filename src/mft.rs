@@ -413,6 +413,8 @@ impl std::fmt::Display for MFTRecord {
                 "Symlink"
             } else if rp.tag == REPARSE_TAG_MOUNT_POINT {
                 "Mount Point / Junction"
+            } else if rp.tag == REPARSE_TAG_LX_SYMLINK {
+                "WSL Symlink"
             } else {
                 "Other"
             };
@@ -645,6 +647,7 @@ impl TryFrom<u32> for AttributeType {
 
 pub const REPARSE_TAG_MOUNT_POINT: u32 = 0xA0000003;
 pub const REPARSE_TAG_SYMLINK: u32 = 0xA000000C;
+pub const REPARSE_TAG_LX_SYMLINK: u32 = 0x9000701A;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReparsePointAttr {
@@ -702,7 +705,18 @@ impl ReparsePointAttr {
                     print_name = decode_utf16(print_raw);
                 }
             }
+            REPARSE_TAG_LX_SYMLINK => {
+                let _version = cur.read_u32::<LittleEndian>().ok()?;
+                let buffer_start = 8 + 4; // 8 bytes for header, 4 for version
+                if raw.len() > buffer_start {
+                    let sub_raw = &raw[buffer_start..];
+                    if let Ok(s) = std::str::from_utf8(sub_raw) {
+                        target = Some(s.trim_end_matches('\0').to_string());
+                    }
+                }
+            }
             _ => {}
+
         }
 
         Some(Self {
