@@ -413,8 +413,8 @@ impl std::fmt::Display for MFTRecord {
                 "Symlink"
             } else if rp.tag == REPARSE_TAG_MOUNT_POINT {
                 "Mount Point / Junction"
-            } else if rp.tag == REPARSE_TAG_LX_SYMLINK {
-                "WSL Symlink"
+            } else if rp.tag == REPARSE_TAG_CLOUD_7 {
+                "Cloud (OneDrive)"
             } else {
                 "Other"
             };
@@ -647,7 +647,7 @@ impl TryFrom<u32> for AttributeType {
 
 pub const REPARSE_TAG_MOUNT_POINT: u32 = 0xA0000003;
 pub const REPARSE_TAG_SYMLINK: u32 = 0xA000000C;
-pub const REPARSE_TAG_LX_SYMLINK: u32 = 0x9000701A;
+pub const REPARSE_TAG_CLOUD_7: u32 = 0x9000701A;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReparsePointAttr {
@@ -705,17 +705,38 @@ impl ReparsePointAttr {
                     print_name = decode_utf16(print_raw);
                 }
             }
-            REPARSE_TAG_LX_SYMLINK => {
-                let _version = cur.read_u32::<LittleEndian>().ok()?;
-                let buffer_start = 8 + 4; // 8 bytes for header, 4 for version
+            REPARSE_TAG_CLOUD_7 => {
+                let buffer_start = 8;
                 if raw.len() > buffer_start {
                     let sub_raw = &raw[buffer_start..];
-                    if let Ok(s) = std::str::from_utf8(sub_raw) {
-                        target = Some(s.trim_end_matches('\0').to_string());
+                    if let Ok(s) = String::from_utf16(
+                        &sub_raw
+                            .chunks_exact(2)
+                            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                            .collect::<Vec<_>>(),
+                    ) {
+                        // The OneDrive sync root identity or related paths are often stored as UTF-16
+                        // with scattered null terminators and binary data. We'll extract a cleaned up chunk.
+                        if let Some(pos) = s.find("SyncRootIdentity") {
+                            let start = s[..pos].rfind('\0').map(|i| i + 1).unwrap_or(0);
+                            let end = s[pos..].find('\0').map(|i| pos + i).unwrap_or(s.len());
+                            target = Some(s[start..end].to_string());
+                        } else {
+                            if let Some(end) = s.find("\0\0") {
+                                if end > 4 {
+                                    target = Some(s[..end].replace('\0', ""));
+                                }
+                            } else if let Some(end) = s.find('\0') {
+                                if end > 4 {
+                                    target = Some(s[..end].to_string());
+                                }
+                            }
+                        }
                     }
                 }
             }
             _ => {}
+
 
         }
 
