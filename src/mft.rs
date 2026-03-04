@@ -277,9 +277,21 @@ impl MFTRecord {
             }
             default
         }
-    }
 
-    /// Convert record to a human‑readable table string.
+    /// Return the parsed ReparsePointAttr if this record is a reparse point.
+    pub fn reparse_point(&self) -> Option<ReparsePointAttr> {
+        self.attributes.iter().find_map(|a| match a {
+            Attribute::Resident { header, value, .. }
+                if header.attr_type == AttributeType::ReparsePoint =>
+            {
+                ReparsePointAttr::from_bytes(&value)
+            }
+            _ => None,
+        })
+    }
+}
+
+/// Convert record to a human‑readable table string.
 impl std::fmt::Display for MFTRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut out = String::new();
@@ -603,9 +615,88 @@ impl TryFrom<u32> for AttributeType {
             0xE0 => Ea,
             0xF0 => PropertySet,
             0x100 => LoggedUtilityStream,
-            _ => return Err("unknown attribute type".to_string()),
+            _ => return Err(format!("unknown attribute type: 0x{:X}", value)),
         })
     }
+}
+
+pub const REPARSE_TAG_MOUNT_POINT: u32 = 0xA0000003;
+pub const REPARSE_TAG_SYMLINK: u32 = 0xA000000C;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReparsePointAttr {
+    pub tag: u32,
+    pub target: Option<String>,
+    pub print_name: Option<String>,
+}
+
+impl ReparsePointAttr {
+    pub fn from_bytes(raw: &[u8]) -> Option<Self> {
+        if raw.len() < 8 {
+            return None;
+        }
+        let mut cur = Cursor::new(raw);
+        let tag = cur.read_u32::<LittleEndian>().ok()?;
+        let _data_len = cur.read_u16::<LittleEndian>().ok()?;
+        let _reserved = cur.read_u16::<LittleEndian>().ok()?;
+
+        let mut target = None;
+        let mut print_name = None;
+
+        match tag {
+            REPARSE_TAG_MOUNT_POINT => {
+                let sub_off = cur.read_u16::<LittleEndian>().ok()? as usize;
+                let sub_len = cur.read_u16::<LittleEndian>().ok()? as usize;
+                let print_off = cur.read_u16::<LittleEndian>().ok()? as usize;
+                let print_len = cur.read_u16::<LittleEndian>().ok()? as usize;
+
+                let buffer_start = 8 + 8;
+                if raw.len() >= buffer_start + sub_off + sub_len {
+                    let sub_raw = &raw[buffer_start + sub_off..buffer_start + sub_off + sub_len];
+                    target = decode_utf16(sub_raw);
+                }
+                if raw.len() >= buffer_start + print_off + print_len {
+                    let print_raw =
+                        &raw[buffer_start + print_off..buffer_start + print_off + print_len];
+                    print_name = decode_utf16(print_raw);
+                }
+            }
+            REPARSE_TAG_SYMLINK => {
+                let sub_off = cur.read_u16::<LittleEndian>().ok()? as usize;
+                let sub_len = cur.read_u16::<LittleEndian>().ok()? as usize;
+                let print_off = cur.read_u16::<LittleEndian>().ok()? as usize;
+                let print_len = cur.read_u16::<LittleEndian>().ok()? as usize;
+                let _flags = cur.read_u32::<LittleEndian>().ok()?;
+
+                let buffer_start = 8 + 12;
+                if raw.len() >= buffer_start + sub_off + sub_len {
+                    let sub_raw = &raw[buffer_start + sub_off..buffer_start + sub_off + sub_len];
+                    target = decode_utf16(sub_raw);
+                }
+                if raw.len() >= buffer_start + print_off + print_len {
+                    let print_raw =
+                        &raw[buffer_start + print_off..buffer_start + print_off + print_len];
+                    print_name = decode_utf16(print_raw);
+                }
+            }
+            _ => {}
+        }
+
+        Some(Self {
+            tag,
+            target,
+            print_name,
+        })
+    }
+}
+
+fn decode_utf16(raw: &[u8]) -> Option<String> {
+    String::from_utf16(
+        &raw.chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect::<Vec<_>>(),
+    )
+    .ok()
 }
 
 pub fn filetime_to_local_datetime(ft: u64) -> String {
@@ -702,6 +793,7 @@ pub struct FileNameAttr {
     pub modified: u64,     // FILETIME
     pub mft_modified: u64, // FILETIME
     pub accessed: u64,     // FILETIME
+    pub reparse_tag: u32,
 }
 
 impl FileNameAttr {
@@ -722,7 +814,7 @@ impl FileNameAttr {
         let allocated_size = cur.read_u64::<LittleEndian>().ok()?;
         let real_size = cur.read_u64::<LittleEndian>().ok()?;
         let flags = cur.read_u32::<LittleEndian>().ok()?;
-        cur.read_u32::<LittleEndian>().ok()?; // reparse value
+        let reparse_tag = cur.read_u32::<LittleEndian>().ok()?; // reparse value
         let name_len = cur.read_u8().ok()? as usize;
         cur.read_u8().ok()?; // namespace
 
@@ -731,13 +823,7 @@ impl FileNameAttr {
             return None;
         }
         let name_raw = &raw[name_off..name_off + name_len * 2];
-        let name = String::from_utf16(
-            &name_raw
-                .chunks_exact(2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                .collect::<Vec<_>>(),
-        )
-        .ok()?;
+        let name = decode_utf16(name_raw)?;
 
         Some(Self {
             parent_ref,
@@ -750,6 +836,7 @@ impl FileNameAttr {
             modified,
             mft_modified,
             accessed,
+            reparse_tag,
         })
     }
 
@@ -769,6 +856,7 @@ impl FileNameAttr {
             "mft_modified":  filetime_to_local_datetime(self.mft_modified),
             "accessed":      filetime_to_local_datetime(self.accessed),
             "flags": self.flags,
+            "reparse_tag": self.reparse_tag,
         })
     }
 }

@@ -5,7 +5,7 @@ use exhume_ntfs::{NTFS, ReuseCheck, bitlocker::BitLockerStream};
 use log::{debug, error};
 use serde_json::{Value, json};
 use std::io::{Read, Seek};
-use std::str::FromStr;
+
 
 fn main() {
     let matches = Command::new("exhume_ntfs")
