@@ -7,7 +7,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use chrono::{TimeZone, Utc};
 use core::convert::TryFrom;
 use log::{debug, error, warn};
-use prettytable::{row, Table};
+use prettytable::{Table, row};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -266,17 +266,19 @@ impl MFTRecord {
             } else {
                 None
             }
-        })
-            && root.len() >= 0x0C {
-                let mut c = Cursor::new(root);
-                c.set_position(8);
-                if let Ok(sz) = c.read_u32::<LittleEndian>()
-                    && sz.is_power_of_two() && (512..=65_536).contains(&sz) {
-                        return sz;
-                    }
+        }) && root.len() >= 0x0C
+        {
+            let mut c = Cursor::new(root);
+            c.set_position(8);
+            if let Ok(sz) = c.read_u32::<LittleEndian>()
+                && sz.is_power_of_two()
+                && (512..=65_536).contains(&sz)
+            {
+                return sz;
             }
-            default
         }
+        default
+    }
 
     /// Return the parsed ReparsePointAttr if this record is a reparse point.
     pub fn reparse_point(&self) -> Option<ReparsePointAttr> {
@@ -413,7 +415,7 @@ impl std::fmt::Display for MFTRecord {
                 "Symlink"
             } else if rp.tag == REPARSE_TAG_MOUNT_POINT {
                 "Mount Point / Junction"
-            } else if rp.tag == REPARSE_TAG_CLOUD_7 {
+            } else if is_cloud_reparse_tag(rp.tag) {
                 "Cloud (OneDrive)"
             } else {
                 "Other"
@@ -424,6 +426,63 @@ impl std::fmt::Display for MFTRecord {
             }
             if let Some(print_name) = &rp.print_name {
                 t.add_row(row![b -> "Print Name", print_name]);
+            }
+            if let Some(od) = &rp.onedrive {
+                t.add_row(row![b -> "Cloud Variant", od.cloud_variant]);
+                if let Some(cid) = &od.cid {
+                    t.add_row(row![b -> "OneDrive CID", cid]);
+                }
+                if let Some(account_type) = &od.account_type {
+                    t.add_row(row![b -> "Account Type", account_type]);
+                }
+                if let Some(magic) = &od.magic {
+                    t.add_row(row![b -> "Magic", magic]);
+                }
+                if let Some(outer_flags) = od.outer_flags {
+                    t.add_row(row![b -> "Outer Flags", format!("0x{:04X}", outer_flags)]);
+                }
+                if let Some(crc32) = od.crc32 {
+                    t.add_row(row![b -> "CRC32", format!("0x{:08X}", crc32)]);
+                }
+                if let Some(file_data_flags) = od.file_data_flags {
+                    t.add_row(row![
+                        b -> "FileData Flags",
+                        format!("0x{:04X}", file_data_flags)
+                    ]);
+                }
+                if !od.elements.is_empty() {
+                    for (idx, elem) in od.elements.iter().take(8).enumerate() {
+                        let mut parts = vec![
+                            format!("type=0x{:04X}", elem.element_type),
+                            format!("len={}", elem.length),
+                            format!("off=0x{:X}", elem.offset),
+                            if elem.in_bounds {
+                                "in-bounds".to_string()
+                            } else {
+                                "out-of-bounds".to_string()
+                            },
+                        ];
+                        if let Some(v) = elem.value_u32 {
+                            parts.push(format!("u32={}", v));
+                        }
+                        if let Some(v) = elem.value_u64 {
+                            parts.push(format!("u64={}", v));
+                        }
+                        if let Some(v) = &elem.value_utf16 {
+                            parts.push(format!("utf16=\"{}\"", v));
+                        }
+                        if let Some(v) = &elem.value_hex {
+                            parts.push(format!("hex={}", v));
+                        }
+                        t.add_row(row![format!("- Element {}", idx), parts.join(", ")]);
+                    }
+                    if od.elements.len() > 8 {
+                        t.add_row(row![
+                            "- Elements",
+                            format!("{} total (showing first 8)", od.elements.len())
+                        ]);
+                    }
+                }
             }
             out.push('\n');
             out.push_str(&t.to_string());
@@ -446,7 +505,7 @@ impl std::fmt::Display for MFTRecord {
     }
 }
 
-    /// Serialize to JSON (uses `serde`).
+/// Serialize to JSON (uses `serde`).
 impl MFTRecord {
     pub fn to_json(&self) -> Value {
         json!({
@@ -647,6 +706,7 @@ impl TryFrom<u32> for AttributeType {
 
 pub const REPARSE_TAG_MOUNT_POINT: u32 = 0xA0000003;
 pub const REPARSE_TAG_SYMLINK: u32 = 0xA000000C;
+pub const REPARSE_TAG_CLOUD: u32 = 0x9000001A;
 pub const REPARSE_TAG_CLOUD_7: u32 = 0x9000701A;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -654,6 +714,34 @@ pub struct ReparsePointAttr {
     pub tag: u32,
     pub target: Option<String>,
     pub print_name: Option<String>,
+    pub onedrive: Option<OneDriveReparseInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OneDriveReparseInfo {
+    pub cloud_variant: u8,
+    pub cid: Option<String>,
+    pub account_type: Option<String>,
+    pub magic: Option<String>,
+    pub outer_flags: Option<u16>,
+    pub outer_length: Option<u16>,
+    pub crc32: Option<u32>,
+    pub file_data_length: Option<u32>,
+    pub file_data_flags: Option<u16>,
+    pub element_count: Option<u16>,
+    pub elements: Vec<OneDriveReparseElement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OneDriveReparseElement {
+    pub element_type: u16,
+    pub length: u16,
+    pub offset: u32,
+    pub in_bounds: bool,
+    pub value_hex: Option<String>,
+    pub value_u32: Option<u32>,
+    pub value_u64: Option<u64>,
+    pub value_utf16: Option<String>,
 }
 
 impl ReparsePointAttr {
@@ -663,11 +751,18 @@ impl ReparsePointAttr {
         }
         let mut cur = Cursor::new(raw);
         let tag = cur.read_u32::<LittleEndian>().ok()?;
-        let _data_len = cur.read_u16::<LittleEndian>().ok()?;
+        let data_len = cur.read_u16::<LittleEndian>().ok()? as usize;
         let _reserved = cur.read_u16::<LittleEndian>().ok()?;
+        let payload_end = 8usize.saturating_add(data_len).min(raw.len());
+        let payload = if payload_end >= 8 {
+            &raw[8..payload_end]
+        } else {
+            &[]
+        };
 
         let mut target = None;
         let mut print_name = None;
+        let mut onedrive = None;
 
         match tag {
             REPARSE_TAG_MOUNT_POINT => {
@@ -705,45 +800,23 @@ impl ReparsePointAttr {
                     print_name = decode_utf16(print_raw);
                 }
             }
-            REPARSE_TAG_CLOUD_7 => {
-                let buffer_start = 8;
-                if raw.len() > buffer_start {
-                    let sub_raw = &raw[buffer_start..];
-                    if let Ok(s) = String::from_utf16(
-                        &sub_raw
-                            .chunks_exact(2)
-                            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                            .collect::<Vec<_>>(),
-                    ) {
-                        // The OneDrive sync root identity or related paths are often stored as UTF-16
-                        // with scattered null terminators and binary data. We'll extract a cleaned up chunk.
-                        if let Some(pos) = s.find("SyncRootIdentity") {
-                            let start = s[..pos].rfind('\0').map(|i| i + 1).unwrap_or(0);
-                            let end = s[pos..].find('\0').map(|i| pos + i).unwrap_or(s.len());
-                            target = Some(s[start..end].to_string());
-                        } else {
-                            if let Some(end) = s.find("\0\0") {
-                                if end > 4 {
-                                    target = Some(s[..end].replace('\0', ""));
-                                }
-                            } else if let Some(end) = s.find('\0') {
-                                if end > 4 {
-                                    target = Some(s[..end].to_string());
-                                }
-                            }
-                        }
-                    }
+            _ if is_cloud_reparse_tag(tag) => {
+                let parsed = parse_onedrive_reparse(payload, tag);
+                if parsed.magic.as_deref() == Some("FeRp") {
+                    print_name = Some("OneDrive Placeholder (FeRp)".to_string());
+                } else {
+                    print_name = Some("OneDrive Placeholder".to_string());
                 }
+                onedrive = Some(parsed);
             }
             _ => {}
-
-
         }
 
         Some(Self {
             tag,
             target,
             print_name,
+            onedrive,
         })
     }
 }
@@ -755,6 +828,189 @@ fn decode_utf16(raw: &[u8]) -> Option<String> {
             .collect::<Vec<_>>(),
     )
     .ok()
+}
+
+fn is_cloud_reparse_tag(tag: u32) -> bool {
+    tag & 0xFFFF_0FFF == REPARSE_TAG_CLOUD
+}
+
+fn parse_onedrive_reparse(payload: &[u8], tag: u32) -> OneDriveReparseInfo {
+    let cloud_variant = ((tag >> 12) & 0xF) as u8;
+    let mut info = OneDriveReparseInfo {
+        cloud_variant,
+        cid: None,
+        account_type: None,
+        magic: None,
+        outer_flags: None,
+        outer_length: None,
+        crc32: None,
+        file_data_length: None,
+        file_data_flags: None,
+        element_count: None,
+        elements: Vec::new(),
+    };
+
+    let flattened = flatten_printable_ascii(payload);
+    if let Some(guid) = find_guid_token(&flattened) {
+        info.cid = Some(guid);
+        info.account_type = Some("OneDrive Business".to_string());
+    } else if let Some(personal_cid) = find_personal_cid_token(&flattened) {
+        info.cid = Some(personal_cid);
+        info.account_type = Some("OneDrive Personal".to_string());
+    } else {
+        info.account_type = Some("Unknown".to_string());
+    }
+
+    if payload.len() < 20 {
+        return info;
+    }
+
+    let outer_flags = u16::from_le_bytes([payload[0], payload[1]]);
+    let outer_length = u16::from_le_bytes([payload[2], payload[3]]);
+    let magic_u32 = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let crc32 = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
+    let file_data_length = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
+    let file_data_flags = u16::from_le_bytes([payload[16], payload[17]]);
+    let element_count = u16::from_le_bytes([payload[18], payload[19]]);
+
+    info.outer_flags = Some(outer_flags);
+    info.outer_length = Some(outer_length);
+    info.magic = magic_u32
+        .to_le_bytes()
+        .iter()
+        .all(|b| b.is_ascii_graphic())
+        .then(|| String::from_utf8_lossy(&magic_u32.to_le_bytes()).to_string());
+    info.crc32 = Some(crc32);
+    info.file_data_length = Some(file_data_length);
+    info.file_data_flags = Some(file_data_flags);
+    info.element_count = Some(element_count);
+
+    let capped_count = usize::from(element_count).min(256);
+    let desc_start = 20usize;
+    let max_desc_count = payload.len().saturating_sub(desc_start) / 8;
+    let parse_count = capped_count.min(max_desc_count);
+
+    for i in 0..parse_count {
+        let pos = desc_start + i * 8;
+        let element_type = u16::from_le_bytes([payload[pos], payload[pos + 1]]);
+        let length = u16::from_le_bytes([payload[pos + 2], payload[pos + 3]]);
+        let offset = u32::from_le_bytes([
+            payload[pos + 4],
+            payload[pos + 5],
+            payload[pos + 6],
+            payload[pos + 7],
+        ]);
+
+        if element_type == 0 && length == 0 && offset == 0 {
+            continue;
+        }
+
+        let element_start = 4usize.saturating_add(offset as usize);
+        let element_end = element_start.saturating_add(length as usize);
+        let in_bounds = element_end <= payload.len();
+        let value = if in_bounds {
+            &payload[element_start..element_end]
+        } else {
+            &[]
+        };
+        let value_hex = if in_bounds {
+            let preview_len = value.len().min(64);
+            let mut out = hex::encode(&value[..preview_len]);
+            if value.len() > preview_len {
+                out.push_str("...");
+            }
+            Some(out)
+        } else {
+            None
+        };
+        let value_u32 = (in_bounds && value.len() >= 4)
+            .then(|| u32::from_le_bytes([value[0], value[1], value[2], value[3]]));
+        let value_u64 = (in_bounds && value.len() >= 8).then(|| {
+            u64::from_le_bytes([
+                value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+            ])
+        });
+        let value_utf16 = (in_bounds && value.len() >= 2 && value.len().is_multiple_of(2))
+            .then(|| decode_utf16(value))
+            .flatten()
+            .filter(|s| !s.trim_matches(char::from(0)).is_empty());
+
+        info.elements.push(OneDriveReparseElement {
+            element_type,
+            length,
+            offset,
+            in_bounds,
+            value_hex,
+            value_u32,
+            value_u64,
+            value_utf16,
+        });
+    }
+
+    info
+}
+
+fn flatten_printable_ascii(raw: &[u8]) -> String {
+    raw.iter()
+        .filter(|b| b.is_ascii_graphic())
+        .map(|b| *b as char)
+        .collect()
+}
+
+fn is_ascii_hex(b: u8) -> bool {
+    b.is_ascii_hexdigit()
+}
+
+fn find_guid_token(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    if bytes.len() < 36 {
+        return None;
+    }
+    for i in 0..=bytes.len() - 36 {
+        let s = &bytes[i..i + 36];
+        if s[8] != b'-' || s[13] != b'-' || s[18] != b'-' || s[23] != b'-' {
+            continue;
+        }
+        let mut ok = true;
+        for (idx, b) in s.iter().enumerate() {
+            if [8, 13, 18, 23].contains(&idx) {
+                continue;
+            }
+            if !is_ascii_hex(*b) {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        if !(b'1'..=b'5').contains(&s[14].to_ascii_lowercase()) {
+            continue;
+        }
+        let var = s[19].to_ascii_lowercase();
+        if !(var == b'8' || var == b'9' || var == b'a' || var == b'b') {
+            continue;
+        }
+        return Some(String::from_utf8_lossy(s).to_string());
+    }
+    None
+}
+
+fn find_personal_cid_token(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    if bytes.len() < 17 {
+        return None;
+    }
+    for i in 0..=bytes.len() - 17 {
+        let s = &bytes[i..i + 17];
+        if s[16] != b'!' {
+            continue;
+        }
+        if s[..16].iter().all(|b| is_ascii_hex(*b)) {
+            return Some(String::from_utf8_lossy(&s[..16]).to_string());
+        }
+    }
+    None
 }
 
 pub fn filetime_to_local_datetime(ft: u64) -> String {
@@ -1076,4 +1332,73 @@ pub fn parse_index_root(raw: &[u8]) -> Option<Vec<DirectoryEntry>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        REPARSE_TAG_CLOUD_7, ReparsePointAttr, find_guid_token, find_personal_cid_token,
+        parse_onedrive_reparse,
+    };
+
+    #[test]
+    fn parse_onedrive_ferp_payload() {
+        let mut raw: Vec<u8> = vec![
+            0x1A, 0x70, 0x00, 0x90, 0x6C, 0x00, 0x00, 0x00, // reparse header
+            0x01, 0x00, 0x6C, 0x00, 0x46, 0x65, 0x52, 0x70, // HSM header + "FeRp"
+            0xED, 0x47, 0xD0, 0x1A, 0x68, 0x00, 0x00, 0x00, // crc32 + file data length
+            0x02, 0x00, 0x0A, 0x00, // file data flags + element count
+            0x07, 0x00, 0x01, 0x00, 0x60, 0x00, 0x00, 0x00, // element 0
+            0x0A, 0x00, 0x04, 0x00, 0x64, 0x00, 0x00, 0x00, // element 1
+        ];
+        raw.resize(116, 0);
+        raw[108] = 1;
+        raw[112] = 118;
+
+        let rp = ReparsePointAttr::from_bytes(&raw).expect("cloud tag should parse");
+        assert_eq!(rp.tag, REPARSE_TAG_CLOUD_7);
+        assert_eq!(
+            rp.print_name.as_deref(),
+            Some("OneDrive Placeholder (FeRp)")
+        );
+
+        let od = rp.onedrive.expect("onedrive metadata should be present");
+        assert_eq!(od.cloud_variant, 7);
+        assert_eq!(od.magic.as_deref(), Some("FeRp"));
+        assert_eq!(od.outer_flags, Some(1));
+        assert_eq!(od.outer_length, Some(108));
+        assert_eq!(od.file_data_flags, Some(2));
+        assert_eq!(od.element_count, Some(10));
+        assert_eq!(od.elements.len(), 2);
+        assert_eq!(od.elements[0].element_type, 7);
+        assert_eq!(od.elements[0].length, 1);
+        assert_eq!(od.elements[0].offset, 96);
+        assert_eq!(od.elements[1].element_type, 10);
+        assert_eq!(od.elements[1].length, 4);
+        assert_eq!(od.elements[1].offset, 100);
+        assert_eq!(od.elements[1].value_u32, Some(118));
+    }
+
+    #[test]
+    fn find_business_and_personal_cids() {
+        assert_eq!(
+            find_guid_token("foo71f3922d-b05e-42f6-a7d5-5f2605843ecabar"),
+            Some("71f3922d-b05e-42f6-a7d5-5f2605843eca".to_string())
+        );
+        assert_eq!(
+            find_personal_cid_token("foo0123456789ABCDEF!bar"),
+            Some("0123456789ABCDEF".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_onedrive_payload_with_embedded_cid() {
+        let payload = b"\x01\x00\x20\x00FeRp____AAAA71f3922d-b05e-42f6-a7d5-5f2605843ecaBBBB";
+        let info = parse_onedrive_reparse(payload, REPARSE_TAG_CLOUD_7);
+        assert_eq!(info.account_type.as_deref(), Some("OneDrive Business"));
+        assert_eq!(
+            info.cid.as_deref(),
+            Some("71f3922d-b05e-42f6-a7d5-5f2605843eca")
+        );
+    }
 }
