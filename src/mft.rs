@@ -405,6 +405,28 @@ impl std::fmt::Display for MFTRecord {
             out.push_str(&t.to_string());
         }
 
+        //  Reparse Point
+        if let Some(rp) = self.reparse_point() {
+            let mut t = Table::new();
+            t.add_row(row!["$REPARSE_POINT"]);
+            let type_str = if rp.tag == REPARSE_TAG_SYMLINK {
+                "Symlink"
+            } else if rp.tag == REPARSE_TAG_MOUNT_POINT {
+                "Mount Point / Junction"
+            } else {
+                "Other"
+            };
+            t.add_row(row![b -> "Type", format!("{} (0x{:X})", type_str, rp.tag)]);
+            if let Some(target) = &rp.target {
+                t.add_row(row![b -> "Target", target]);
+            }
+            if let Some(print_name) = &rp.print_name {
+                t.add_row(row![b -> "Print Name", print_name]);
+            }
+            out.push('\n');
+            out.push_str(&t.to_string());
+        }
+
         //  Alternate Data Streams
         let ads = self.alternate_data_streams();
         if !ads.is_empty() {
@@ -430,6 +452,7 @@ impl MFTRecord {
             "attributes": &self.attributes,
             "file_names": self.file_names().into_iter().map(|f| f.to_json()).collect::<Vec<_>>(),
             "ads": self.alternate_data_streams(),
+            "reparse_point": self.reparse_point(),
         })
     }
 }
