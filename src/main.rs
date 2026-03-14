@@ -5,7 +5,6 @@ use exhume_ntfs::{NTFS, ReuseCheck, bitlocker::BitLockerStream};
 use log::{debug, error};
 use serde_json::{Value, json};
 use std::io::{Read, Seek};
-use std::str::FromStr;
 
 fn main() {
     let matches = Command::new("exhume_ntfs")
@@ -171,13 +170,14 @@ fn main() {
             }
         };
         debug!("Initializing BitLocker stream with FVEK");
-        let mut bl_stream = match BitLockerStream::new(slice, &fvek_bytes, body.get_sector_size() as u64) {
-             Ok(s) => s,
-             Err(e) => {
-                 error!("Could not create BitLocker stream: {}", e);
-                 return;
-             }
-        };
+        let mut bl_stream =
+            match BitLockerStream::new(slice, &fvek_bytes, body.get_sector_size() as u64) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Could not create BitLocker stream: {}", e);
+                    return;
+                }
+            };
         let mut filesystem = match NTFS::new(&mut bl_stream) {
             Ok(fs) => fs,
             Err(e) => {
@@ -219,7 +219,6 @@ fn run_exhume<T: Read + Seek>(filesystem: &mut NTFS<T>, matches: &ArgMatches) {
     let json_output = matches.get_flag("json");
     let file_id = matches.get_one::<usize>("file_id").copied().unwrap_or(0);
     let show_dir_entry = matches.get_flag("dir_entry");
-
 
     if show_pbs {
         if json_output {
