@@ -1,2 +1,3 @@
 # exhume_ntfs
-Exhume and investigate data from an NTFS filesystem.
+
+The `exhume_ntfs` documentation is maintained at [forensicxlab.com](https://www.forensicxlab.com/docs/exhume_ntfs/getting-started).
