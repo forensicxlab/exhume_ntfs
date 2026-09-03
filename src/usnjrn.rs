@@ -8,7 +8,7 @@
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use chrono::{TimeZone, Utc};
-use prettytable::{row, Table};
+use prettytable::{Table, row};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -420,33 +420,34 @@ impl std::fmt::Display for UsnRecord {
             }
         }
         if let Some(rr) = &self.reused_records
-            && !rr.is_empty() {
-                let mut subtbl = prettytable::Table::new();
-                subtbl.add_row(row!["Index", "Current Seq", "Seen Seqs", "Reasons", "Name"]);
-                for e in rr {
-                    subtbl.add_row(row![
-                        e.index,
-                            e.current_seq.map_or("-".to_string(), |s| s.to_string()),
-                        if e.seen_sequences.is_empty() {
-                            "-".to_string()
-                        } else {
-                            e.seen_sequences
-                                .iter()
-                                .map(|s| s.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        },
-                        e.reason
+            && !rr.is_empty()
+        {
+            let mut subtbl = prettytable::Table::new();
+            subtbl.add_row(row!["Index", "Current Seq", "Seen Seqs", "Reasons", "Name"]);
+            for e in rr {
+                subtbl.add_row(row![
+                    e.index,
+                    e.current_seq.map_or("-".to_string(), |s| s.to_string()),
+                    if e.seen_sequences.is_empty() {
+                        "-".to_string()
+                    } else {
+                        e.seen_sequences
                             .iter()
-                            .map(|r| format!("{:?}", r))
+                            .map(|s| s.to_string())
                             .collect::<Vec<_>>()
-                            .join(" | "),
-                        e.name.clone().unwrap_or_else(|| "-".into())
-                    ]);
-                }
-                // Add the sub-table as a single cell in the main table
-                t.add_row(row![b -> "Reused records", subtbl.to_string()]);
+                            .join(",")
+                    },
+                    e.reason
+                        .iter()
+                        .map(|r| format!("{:?}", r))
+                        .collect::<Vec<_>>()
+                        .join(" | "),
+                    e.name.clone().unwrap_or_else(|| "-".into())
+                ]);
             }
+            // Add the sub-table as a single cell in the main table
+            t.add_row(row![b -> "Reused records", subtbl.to_string()]);
+        }
         write!(f, "{}", t)
     }
 }

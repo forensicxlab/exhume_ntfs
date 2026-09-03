@@ -7,7 +7,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use chrono::{TimeZone, Utc};
 use core::convert::TryFrom;
 use log::{debug, error, warn};
-use prettytable::{row, Table};
+use prettytable::{Table, row};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -92,17 +92,43 @@ pub struct MFTRecord {
     pub id: u64,
     pub header: FileRecordHeader,
     pub attributes: Vec<Attribute>,
+    /// Physical extension records merged into this logical record through
+    /// `$ATTRIBUTE_LIST`. Empty for records parsed directly from disk.
+    #[serde(default)]
+    pub extension_record_ids: Vec<u64>,
 }
 
-// At the end of every 512‑byte sector NTFS overwrites the last two bytes with the Update‑Sequence Number (USN).
-fn apply_fixups(buf: &mut [u8], usa_offset: usize, usa_count: usize) -> Result<(), String> {
-    if usa_offset + 2 * usa_count > buf.len() {
+/// Apply an NTFS update-sequence array using the supplied sector size.
+///
+/// Every protected sector must carry the update-sequence number before any
+/// replacement word is applied. A mismatch invalidates the complete record;
+/// callers must never continue parsing a partially fixed record.
+pub(crate) fn apply_fixups_with_sector_size(
+    buf: &mut [u8],
+    usa_offset: usize,
+    usa_count: usize,
+    sector_size: usize,
+) -> Result<(), String> {
+    let usa_bytes = usa_count.checked_mul(2).ok_or("USA byte count overflow")?;
+    let usa_end = usa_offset
+        .checked_add(usa_bytes)
+        .ok_or("USA offset overflow")?;
+    if usa_count == 0 || usa_end > buf.len() {
         warn!("Incomplete multi‑sector transfer – corrupted MFT record.");
         return Err("USA table outside record".into());
     }
-    if usa_count < 1 {
-        debug!("MFT record verified (USA check OK).");
-        return Ok(());
+    if usa_count == 1 {
+        return Err("USA does not protect any sector".into());
+    }
+    if !(256..=4096).contains(&sector_size) || !sector_size.is_power_of_two() {
+        return Err("invalid USA sector size".into());
+    }
+
+    let protected_len = (usa_count - 1)
+        .checked_mul(sector_size)
+        .ok_or("USA protected length overflow")?;
+    if protected_len != buf.len() {
+        return Err("USA protected length does not match record length".into());
     }
 
     debug!("Detected a multi-sector record, patching.");
@@ -111,7 +137,10 @@ fn apply_fixups(buf: &mut [u8], usa_offset: usize, usa_count: usize) -> Result<(
     let usn = [buf[usa_offset], buf[usa_offset + 1]];
 
     for i in 1..usa_count {
-        let sector_end = i * 512 - 2;
+        let sector_end = i
+            .checked_mul(sector_size)
+            .and_then(|end| end.checked_sub(2))
+            .ok_or("USA sector offset overflow")?;
         if sector_end + 2 > buf.len() {
             return Err(format!("sector {} ends after record", i));
         }
@@ -132,52 +161,121 @@ fn apply_fixups(buf: &mut [u8], usa_offset: usize, usa_count: usize) -> Result<(
     Ok(())
 }
 
+// FILE records do not carry the sector size explicitly. The number of
+// protected sectors is encoded by usa_count, so derive the only sector size
+// consistent with the record length instead of assuming 512-byte sectors.
+fn apply_file_record_fixups(
+    buf: &mut [u8],
+    usa_offset: usize,
+    usa_count: usize,
+) -> Result<(), String> {
+    if usa_count <= 1 {
+        return Err("FILE record has an invalid USA count".into());
+    }
+    let sectors = usa_count - 1;
+    if !buf.len().is_multiple_of(sectors) {
+        return Err("FILE record length is inconsistent with USA count".into());
+    }
+    let sector_size = buf.len() / sectors;
+    apply_fixups_with_sector_size(buf, usa_offset, usa_count, sector_size)
+}
+
 impl MFTRecord {
-    /// Parse a raw 1 KiB record into a `MFTRecord`.
+    /// Parse a raw FILE record when the enclosing NTFS sector geometry is not
+    /// available. The sector size is derived from the USA count.
     pub fn from_bytes(raw: &[u8], identifier: Option<u64>) -> Result<Self, String> {
+        Self::from_bytes_inner(raw, identifier, None)
+    }
+
+    /// Parse a raw FILE record using the authoritative sector size from the
+    /// partition boot sector.
+    pub fn from_bytes_with_sector_size(
+        raw: &[u8],
+        identifier: Option<u64>,
+        sector_size: usize,
+    ) -> Result<Self, String> {
+        Self::from_bytes_inner(raw, identifier, Some(sector_size))
+    }
+
+    fn from_bytes_inner(
+        raw: &[u8],
+        identifier: Option<u64>,
+        sector_size: Option<usize>,
+    ) -> Result<Self, String> {
+        if raw.len() < 0x30 {
+            return Err("MFT record is shorter than its fixed header".into());
+        }
         // we need a mutable copy so we can patch the USNs in‑place
         let mut buf = raw.to_vec();
 
         let mut cursor = Cursor::new(&buf);
         let header = parse_header(&mut cursor)?;
+        if header.usa_offset < 0x2A || header.usa_offset % 2 != 0 {
+            return Err("invalid FILE record USA offset".into());
+        }
 
-        apply_fixups(
-            &mut buf,
-            header.usa_offset as usize,
-            header.usa_count as usize,
-        )?;
+        if let Some(sector_size) = sector_size {
+            apply_fixups_with_sector_size(
+                &mut buf,
+                header.usa_offset as usize,
+                header.usa_count as usize,
+                sector_size,
+            )?;
+        } else {
+            apply_file_record_fixups(
+                &mut buf,
+                header.usa_offset as usize,
+                header.usa_count as usize,
+            )?;
+        }
 
-        cursor = Cursor::new(&buf);
-        cursor
-            .seek(SeekFrom::Start(header.attrs_offset.into()))
-            .unwrap();
+        let bytes_in_use = usize::try_from(header.bytes_in_use)
+            .map_err(|_| "MFT bytes_in_use does not fit in memory")?;
+        let attrs_offset = usize::from(header.attrs_offset);
+        if bytes_in_use > buf.len()
+            || attrs_offset < 0x30
+            || attrs_offset % 8 != 0
+            || attrs_offset > bytes_in_use
+        {
+            return Err("MFT attribute bounds are outside the record".into());
+        }
+        if header.bytes_allocated < header.bytes_in_use
+            || usize::try_from(header.bytes_allocated).unwrap_or(usize::MAX) > buf.len()
+        {
+            return Err("invalid MFT bytes_allocated/bytes_in_use values".into());
+        }
 
         let mut attributes = Vec::new();
+        let mut attr_offset = attrs_offset;
         loop {
             /* stop if fewer than 4 bytes remain */
-            if cursor.position() + 4 > header.bytes_in_use as u64 {
+            if attr_offset
+                .checked_add(4)
+                .is_none_or(|end| end > bytes_in_use)
+            {
                 break;
             }
 
-            let attr_type_num = match cursor.read_u32::<LittleEndian>() {
-                Ok(v) => v,
-                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break, // graceful
-                Err(e) => return Err(e.to_string()),
-            };
+            let attr_type_num = u32::from_le_bytes(
+                buf[attr_offset..attr_offset + 4]
+                    .try_into()
+                    .map_err(|_| "truncated attribute type")?,
+            );
             if attr_type_num == 0xFFFFFFFF {
                 break;
             }
 
             let attr_type = AttributeType::try_from(attr_type_num)?;
-            cursor.seek(SeekFrom::Current(-4)).unwrap();
-            let attr = parse_attribute(&mut cursor, attr_type)?; // propagate errors
+            let (attr, next_offset) = parse_attribute(&buf, attr_offset, bytes_in_use, attr_type)?;
             attributes.push(attr);
+            attr_offset = next_offset;
         }
 
         Ok(MFTRecord {
             id: identifier.unwrap_or(0),
             header,
             attributes,
+            extension_record_ids: Vec::new(),
         })
     }
 
@@ -197,46 +295,102 @@ impl MFTRecord {
             .collect()
     }
 
-    /// Return the first (usually long) name, if present.
+    /// Return the preferred `$FILE_NAME`, independent of on-disk attribute
+    /// ordering. Win32-capable names win over POSIX names, and DOS-only aliases
+    /// are used only as a last resort.
+    pub fn preferred_file_name(&self) -> Option<FileNameAttr> {
+        let mut best = None::<FileNameAttr>;
+        for candidate in self.file_names() {
+            let replace = best.as_ref().is_none_or(|current| {
+                candidate.namespace.preference() > current.namespace.preference()
+            });
+            if replace {
+                best = Some(candidate);
+            }
+        }
+        best
+    }
+
+    /// Return the preferred human-readable name, if present.
     pub fn primary_name(&self) -> Option<String> {
-        self.file_names().into_iter().next().map(|f| f.name)
+        self.preferred_file_name().map(|f| f.name)
     }
 
-    /// Parent directory MFT reference (from the first $FILE_NAME attribute).
+    /// Parent directory MFT reference from the preferred `$FILE_NAME`.
     pub fn parent_file_id(&self) -> Option<u64> {
-        self.file_names().first().map(|f| f.parent_ref)
+        self.preferred_file_name().map(|f| f.parent_ref)
     }
 
-    /// Extract Alternate Data Streams (named $DATA attributes).
-    pub fn alternate_data_streams(&self) -> Vec<DataStream> {
-        self.attributes
-            .iter()
-            .filter_map(|a| match a {
+    /// Logical size of the unnamed `$DATA` stream. For a split non-resident
+    /// stream, size metadata belongs to the extent whose lowest VCN is zero.
+    pub fn unnamed_data_size(&self) -> Option<u64> {
+        let mut resident_size = None;
+        let mut first_extent_size = None;
+        let mut fallback_size = None;
+        for attribute in &self.attributes {
+            match attribute {
                 Attribute::Resident {
                     header, resident, ..
-                } if header.attr_type == AttributeType::Data && header.name_length > 0 => {
-                    Some(DataStream {
-                        name: header.name.clone().unwrap_or_default(),
-                        size: resident.value_length as u64,
-                        resident: true,
-                        attr_id: header.id,
-                    })
+                } if header.attr_type == AttributeType::Data && header.name_length == 0 => {
+                    resident_size.get_or_insert(u64::from(resident.value_length));
                 }
                 Attribute::NonResident {
                     header,
                     non_resident,
                     ..
-                } if header.attr_type == AttributeType::Data && header.name_length > 0 => {
-                    Some(DataStream {
-                        name: header.name.clone().unwrap_or_default(),
-                        size: non_resident.real_size,
-                        resident: false,
-                        attr_id: header.id,
-                    })
+                } if header.attr_type == AttributeType::Data && header.name_length == 0 => {
+                    if non_resident.lowest_vcn == 0 {
+                        first_extent_size.get_or_insert(non_resident.real_size);
+                    }
+                    fallback_size = Some(fallback_size.unwrap_or(0).max(non_resident.real_size));
                 }
-                _ => None,
-            })
-            .collect()
+                _ => {}
+            }
+        }
+        resident_size.or(first_extent_size).or(fallback_size)
+    }
+
+    /// Extract Alternate Data Streams (named $DATA attributes).
+    pub fn alternate_data_streams(&self) -> Vec<DataStream> {
+        let mut streams = Vec::<DataStream>::new();
+        for attribute in &self.attributes {
+            let (header, size, resident, lowest_vcn) = match attribute {
+                Attribute::Resident {
+                    header, resident, ..
+                } if header.attr_type == AttributeType::Data && header.name_length > 0 => {
+                    (header, u64::from(resident.value_length), true, 0)
+                }
+                Attribute::NonResident {
+                    header,
+                    non_resident,
+                    ..
+                } if header.attr_type == AttributeType::Data && header.name_length > 0 => (
+                    header,
+                    non_resident.real_size,
+                    false,
+                    non_resident.lowest_vcn,
+                ),
+                _ => continue,
+            };
+            let name = header.name.clone().unwrap_or_default();
+            if let Some(existing) = streams.iter_mut().find(|stream| stream.name == name) {
+                // The zero-VCN extent owns logical size. Later extents often
+                // carry zero in this field, so never overwrite it blindly.
+                if lowest_vcn == 0 || existing.size == 0 {
+                    existing.size = size;
+                    existing.attr_id = header.id;
+                }
+                existing.resident &= resident;
+            } else {
+                streams.push(DataStream {
+                    name,
+                    size,
+                    resident,
+                    attr_id: header.id,
+                });
+            }
+        }
+        streams
     }
 
     pub fn is_dir(&self) -> bool {
@@ -250,7 +404,9 @@ impl MFTRecord {
         }
         let root_attr = self.attributes.iter().find_map(|a| {
             if let Attribute::Resident { value, header, .. } = a {
-                (header.attr_type == AttributeType::IndexRoot).then_some(value)
+                (header.attr_type == AttributeType::IndexRoot
+                    && header.name.as_deref() == Some("$I30"))
+                .then_some(value)
             } else {
                 None
             }
@@ -262,24 +418,28 @@ impl MFTRecord {
     pub fn index_record_size(&self, default: u32) -> u32 {
         if let Some(root) = self.attributes.iter().find_map(|a| {
             if let Attribute::Resident { value, header, .. } = a {
-                (header.attr_type == AttributeType::IndexRoot).then_some(value)
+                (header.attr_type == AttributeType::IndexRoot
+                    && header.name.as_deref() == Some("$I30"))
+                .then_some(value)
             } else {
                 None
             }
-        })
-            && root.len() >= 0x0C {
-                let mut c = Cursor::new(root);
-                c.set_position(8);
-                if let Ok(sz) = c.read_u32::<LittleEndian>()
-                    && sz.is_power_of_two() && (512..=65_536).contains(&sz) {
-                        return sz;
-                    }
+        }) && root.len() >= 0x0C
+        {
+            let mut c = Cursor::new(root);
+            c.set_position(8);
+            if let Ok(sz) = c.read_u32::<LittleEndian>()
+                && sz.is_power_of_two()
+                && (512..=65_536).contains(&sz)
+            {
+                return sz;
             }
-            default
         }
+        default
     }
+}
 
-    /// Convert record to a human‑readable table string.
+/// Convert record to a human‑readable table string.
 impl std::fmt::Display for MFTRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut out = String::new();
@@ -336,11 +496,11 @@ impl std::fmt::Display for MFTRecord {
             if let Attribute::Resident { value, header, .. } = a {
                 (header.attr_type == AttributeType::StandardInformation)
                     .then(|| StandardInformation::from_bytes(value))
+                    .flatten()
             } else {
                 None
             }
         }) {
-            let std = std.unwrap();
             let mut t = Table::new();
             t.add_row(row!["$STANDARD_INFORMATION"]);
             t.add_row(row![b -> "Created", filetime_to_local_datetime(std.created)]);
@@ -369,6 +529,7 @@ impl std::fmt::Display for MFTRecord {
             t.add_row(row!["$FILE_NAME Attributes"]);
             for fname in names {
                 t.add_row(row![b -> "Name", fname.name.clone()]);
+                t.add_row(row![b -> "Namespace", format!("{:?}", fname.namespace)]);
                 t.add_row(row![b -> "Parent MFT", format!("{} (seq {})", fname.parent_ref, fname.parent_seq)]);
                 t.add_row(row![b -> "Allocated", fname.allocated_size]);
                 t.add_row(row![b -> "Actual", fname.real_size]);
@@ -410,12 +571,14 @@ impl std::fmt::Display for MFTRecord {
     }
 }
 
-    /// Serialize to JSON (uses `serde`).
+/// Serialize to JSON (uses `serde`).
 impl MFTRecord {
     pub fn to_json(&self) -> Value {
         json!({
+            "id": self.id,
             "header": &self.header,
             "attributes": &self.attributes,
+            "extension_record_ids": &self.extension_record_ids,
             "file_names": self.file_names().into_iter().map(|f| f.to_json()).collect::<Vec<_>>(),
             "ads": self.alternate_data_streams(),
         })
@@ -426,7 +589,9 @@ impl MFTRecord {
 
 fn parse_header<R: Read + Seek>(cursor: &mut R) -> Result<FileRecordHeader, String> {
     let mut signature = [0u8; 4];
-    cursor.read_exact(&mut signature).unwrap();
+    cursor
+        .read_exact(&mut signature)
+        .map_err(|e| e.to_string())?;
     if &signature != b"FILE" {
         error!(
             "Record signature is not 'FILE', found: {}",
@@ -434,18 +599,42 @@ fn parse_header<R: Read + Seek>(cursor: &mut R) -> Result<FileRecordHeader, Stri
         );
         return Err("record signature is not 'FILE'".to_string());
     }
-    let usa_offset = cursor.read_u16::<LittleEndian>().unwrap();
-    let usa_count = cursor.read_u16::<LittleEndian>().unwrap();
-    let lsn = cursor.read_u64::<LittleEndian>().unwrap();
-    let sequence_number = cursor.read_u16::<LittleEndian>().unwrap();
-    let hard_link_count = cursor.read_u16::<LittleEndian>().unwrap();
-    let attrs_offset = cursor.read_u16::<LittleEndian>().unwrap();
-    let flags = cursor.read_u16::<LittleEndian>().unwrap();
-    let bytes_in_use = cursor.read_u32::<LittleEndian>().unwrap();
-    let bytes_allocated = cursor.read_u32::<LittleEndian>().unwrap();
-    let base_file_record = cursor.read_u64::<LittleEndian>().unwrap();
-    let next_attr_id = cursor.read_u16::<LittleEndian>().unwrap();
-    cursor.seek(SeekFrom::Current(6)).unwrap();
+    let usa_offset = cursor
+        .read_u16::<LittleEndian>()
+        .map_err(|e| e.to_string())?;
+    let usa_count = cursor
+        .read_u16::<LittleEndian>()
+        .map_err(|e| e.to_string())?;
+    let lsn = cursor
+        .read_u64::<LittleEndian>()
+        .map_err(|e| e.to_string())?;
+    let sequence_number = cursor
+        .read_u16::<LittleEndian>()
+        .map_err(|e| e.to_string())?;
+    let hard_link_count = cursor
+        .read_u16::<LittleEndian>()
+        .map_err(|e| e.to_string())?;
+    let attrs_offset = cursor
+        .read_u16::<LittleEndian>()
+        .map_err(|e| e.to_string())?;
+    let flags = cursor
+        .read_u16::<LittleEndian>()
+        .map_err(|e| e.to_string())?;
+    let bytes_in_use = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| e.to_string())?;
+    let bytes_allocated = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| e.to_string())?;
+    let base_file_record = cursor
+        .read_u64::<LittleEndian>()
+        .map_err(|e| e.to_string())?;
+    let next_attr_id = cursor
+        .read_u16::<LittleEndian>()
+        .map_err(|e| e.to_string())?;
+    cursor
+        .seek(SeekFrom::Current(6))
+        .map_err(|e| e.to_string())?;
     Ok(FileRecordHeader {
         signature,
         usa_offset,
@@ -462,33 +651,89 @@ fn parse_header<R: Read + Seek>(cursor: &mut R) -> Result<FileRecordHeader, Stri
     })
 }
 
-fn parse_attribute<R: Read + Seek>(
-    cursor: &mut R,
+fn parse_attribute(
+    raw: &[u8],
+    start_pos: usize,
+    record_limit: usize,
     attr_type: AttributeType,
-) -> Result<Attribute, String> {
-    let start_pos = cursor.stream_position().unwrap();
+) -> Result<(Attribute, usize), String> {
+    let common_end = start_pos
+        .checked_add(0x10)
+        .ok_or("attribute header offset overflow")?;
+    if common_end > record_limit || common_end > raw.len() {
+        return Err("truncated attribute common header".into());
+    }
 
-    cursor.seek(SeekFrom::Current(4)).unwrap();
-    let length = cursor.read_u32::<LittleEndian>().unwrap();
-    let non_resident = cursor.read_u8().unwrap() != 0;
-    let name_length = cursor.read_u8().unwrap();
-    let name_offset = cursor.read_u16::<LittleEndian>().unwrap();
-    let flags = cursor.read_u16::<LittleEndian>().unwrap();
-    let id = cursor.read_u16::<LittleEndian>().unwrap();
+    let u16_at = |off: usize| -> Result<u16, String> {
+        let end = off.checked_add(2).ok_or("attribute offset overflow")?;
+        let bytes = raw.get(off..end).ok_or("truncated attribute u16")?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    };
+    let u32_at = |off: usize| -> Result<u32, String> {
+        let end = off.checked_add(4).ok_or("attribute offset overflow")?;
+        let bytes = raw.get(off..end).ok_or("truncated attribute u32")?;
+        Ok(u32::from_le_bytes(
+            bytes.try_into().map_err(|_| "truncated attribute u32")?,
+        ))
+    };
+    let u64_at = |off: usize| -> Result<u64, String> {
+        let end = off.checked_add(8).ok_or("attribute offset overflow")?;
+        let bytes = raw.get(off..end).ok_or("truncated attribute u64")?;
+        Ok(u64::from_le_bytes(
+            bytes.try_into().map_err(|_| "truncated attribute u64")?,
+        ))
+    };
+
+    let length = u32_at(start_pos + 4)?;
+    let length_usize = usize::try_from(length).map_err(|_| "attribute length overflow")?;
+    if length_usize < 0x10 || length_usize % 8 != 0 {
+        return Err("attribute length is smaller than its common header".into());
+    }
+    let attr_end = start_pos
+        .checked_add(length_usize)
+        .ok_or("attribute end offset overflow")?;
+    if attr_end > record_limit || attr_end > raw.len() {
+        return Err("attribute extends beyond bytes_in_use".into());
+    }
+
+    let non_resident = raw[start_pos + 8] != 0;
+    if raw[start_pos + 8] > 1 {
+        return Err("invalid resident flag in attribute header".into());
+    }
+    let name_length = raw[start_pos + 9];
+    let name_offset = u16_at(start_pos + 0x0A)?;
+    let flags = u16_at(start_pos + 0x0C)?;
+    let id = u16_at(start_pos + 0x0E)?;
+    let minimum_header_end = start_pos
+        .checked_add(if non_resident { 0x40 } else { 0x18 })
+        .ok_or("attribute header end overflow")?;
+    if attr_end < minimum_header_end {
+        return Err("attribute is shorter than its resident header".into());
+    }
 
     let name = if name_length > 0 {
-        let after_common = cursor.stream_position().unwrap();
-        let name_pos = start_pos + u64::from(name_offset);
-        cursor.seek(SeekFrom::Start(name_pos)).unwrap();
-        let mut raw = vec![0u8; name_length as usize * 2];
-        cursor.read_exact(&mut raw).unwrap();
-        cursor.seek(SeekFrom::Start(after_common)).unwrap();
-        String::from_utf16(
-            &raw.chunks_exact(2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                .collect::<Vec<_>>(),
+        let name_bytes = usize::from(name_length)
+            .checked_mul(2)
+            .ok_or("attribute name length overflow")?;
+        let name_pos = start_pos
+            .checked_add(usize::from(name_offset))
+            .ok_or("attribute name offset overflow")?;
+        let name_end = name_pos
+            .checked_add(name_bytes)
+            .ok_or("attribute name end overflow")?;
+        if name_pos < minimum_header_end || name_end > attr_end {
+            return Err("attribute name extends beyond attribute".into());
+        }
+        let encoded = &raw[name_pos..name_end];
+        Some(
+            String::from_utf16(
+                &encoded
+                    .chunks_exact(2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|_| "attribute name is not valid UTF-16")?,
         )
-        .ok()
     } else {
         None
     };
@@ -505,16 +750,21 @@ fn parse_attribute<R: Read + Seek>(
     };
 
     let attr = if !non_resident {
-        let value_length = cursor.read_u32::<LittleEndian>().unwrap();
-        let value_offset = cursor.read_u16::<LittleEndian>().unwrap();
-        let resident_flags = cursor.read_u8().unwrap();
-        cursor.read_u8().unwrap();
-        let after_resident_pos = cursor.stream_position().unwrap();
-        let value_pos = start_pos + u64::from(value_offset);
-        cursor.seek(SeekFrom::Start(value_pos)).unwrap();
-        let mut value = vec![0u8; value_length as usize];
-        cursor.read_exact(&mut value).unwrap();
-        cursor.seek(SeekFrom::Start(after_resident_pos)).unwrap();
+        let value_length = u32_at(start_pos + 0x10)?;
+        let value_offset = u16_at(start_pos + 0x14)?;
+        let resident_flags = raw[start_pos + 0x16];
+        let value_pos = start_pos
+            .checked_add(usize::from(value_offset))
+            .ok_or("resident value offset overflow")?;
+        let value_end = value_pos
+            .checked_add(
+                usize::try_from(value_length).map_err(|_| "resident value length overflow")?,
+            )
+            .ok_or("resident value end overflow")?;
+        if value_pos < start_pos + 0x18 || value_end > attr_end {
+            return Err("resident value extends beyond attribute".into());
+        }
+        let value = raw[value_pos..value_end].to_vec();
         Attribute::Resident {
             header: common,
             resident: ResidentHeader {
@@ -525,21 +775,23 @@ fn parse_attribute<R: Read + Seek>(
             value,
         }
     } else {
-        let lowest_vcn = cursor.read_u64::<LittleEndian>().unwrap();
-        let highest_vcn = cursor.read_u64::<LittleEndian>().unwrap();
-        let mapping_pairs_offset = cursor.read_u16::<LittleEndian>().unwrap();
-        let compression_unit = cursor.read_u16::<LittleEndian>().unwrap();
-        cursor.seek(SeekFrom::Current(4)).unwrap();
-        let allocated_size = cursor.read_u64::<LittleEndian>().unwrap();
-        let real_size = cursor.read_u64::<LittleEndian>().unwrap();
-        let initialized_size = cursor.read_u64::<LittleEndian>().unwrap();
-        let after_nr_header = cursor.stream_position().unwrap();
-        let run_list_pos = start_pos + u64::from(mapping_pairs_offset);
-        cursor.seek(SeekFrom::Start(run_list_pos)).unwrap();
-        let run_list_len = (length as u64 + start_pos) - run_list_pos;
-        let mut run_list = vec![0u8; run_list_len as usize];
-        cursor.read_exact(&mut run_list).unwrap();
-        cursor.seek(SeekFrom::Start(after_nr_header)).unwrap();
+        let lowest_vcn = u64_at(start_pos + 0x10)?;
+        let highest_vcn = u64_at(start_pos + 0x18)?;
+        let mapping_pairs_offset = u16_at(start_pos + 0x20)?;
+        let compression_unit = u16_at(start_pos + 0x22)?;
+        let allocated_size = u64_at(start_pos + 0x28)?;
+        let real_size = u64_at(start_pos + 0x30)?;
+        let initialized_size = u64_at(start_pos + 0x38)?;
+        let run_list_pos = start_pos
+            .checked_add(usize::from(mapping_pairs_offset))
+            .ok_or("mapping-pairs offset overflow")?;
+        if run_list_pos < start_pos + 0x40 || run_list_pos > attr_end {
+            return Err("mapping pairs extend beyond attribute".into());
+        }
+        if highest_vcn < lowest_vcn && run_list_pos != attr_end {
+            return Err("non-resident attribute has an inverted VCN range".into());
+        }
+        let run_list = raw[run_list_pos..attr_end].to_vec();
         Attribute::NonResident {
             header: common,
             non_resident: NonResidentHeader {
@@ -555,14 +807,11 @@ fn parse_attribute<R: Read + Seek>(
         }
     };
 
-    cursor
-        .seek(SeekFrom::Start(start_pos + u64::from(length)))
-        .unwrap();
-    Ok(attr)
+    Ok((attr, attr_end))
 }
 
 #[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum AttributeType {
     StandardInformation = 0x10,
     AttributeList = 0x20,
@@ -580,6 +829,124 @@ pub enum AttributeType {
     Ea = 0xE0,
     PropertySet = 0xF0,
     LoggedUtilityStream = 0x100,
+}
+
+impl Attribute {
+    pub fn header(&self) -> &AttributeHeaderCommon {
+        match self {
+            Self::Resident { header, .. } | Self::NonResident { header, .. } => header,
+        }
+    }
+
+    pub fn lowest_vcn(&self) -> u64 {
+        match self {
+            Self::Resident { .. } => 0,
+            Self::NonResident { non_resident, .. } => non_resident.lowest_vcn,
+        }
+    }
+}
+
+/// One validated entry in an NTFS `$ATTRIBUTE_LIST` value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttributeListEntry {
+    pub attr_type: AttributeType,
+    pub name: Option<String>,
+    pub lowest_vcn: u64,
+    pub segment_reference: u64,
+    pub segment_sequence: u16,
+    pub attribute_id: u16,
+}
+
+const ATTRIBUTE_LIST_ENTRY_HEADER_SIZE: usize = 0x1A;
+
+/// Parse the value of `$ATTRIBUTE_LIST` with strict entry and allocation
+/// bounds. Padding bytes after the final entry are accepted only when zero.
+pub fn parse_attribute_list(
+    raw: &[u8],
+    max_entries: usize,
+) -> Result<Vec<AttributeListEntry>, String> {
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+
+    while offset < raw.len() {
+        let remaining = &raw[offset..];
+        if remaining.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        if remaining.len() < ATTRIBUTE_LIST_ENTRY_HEADER_SIZE {
+            return Err("truncated ATTRIBUTE_LIST entry header".into());
+        }
+        if entries.len() >= max_entries {
+            return Err("ATTRIBUTE_LIST entry limit exceeded".into());
+        }
+
+        let attr_type_raw = u32::from_le_bytes(
+            remaining[0..4]
+                .try_into()
+                .map_err(|_| "truncated ATTRIBUTE_LIST type")?,
+        );
+        if attr_type_raw == u32::MAX {
+            break;
+        }
+        let attr_type = AttributeType::try_from(attr_type_raw)
+            .map_err(|_| format!("unknown ATTRIBUTE_LIST type 0x{attr_type_raw:X}"))?;
+        let record_length = usize::from(u16::from_le_bytes([remaining[4], remaining[5]]));
+        let name_length = usize::from(remaining[6]);
+        let name_offset = usize::from(remaining[7]);
+        if record_length < ATTRIBUTE_LIST_ENTRY_HEADER_SIZE || record_length > remaining.len() {
+            return Err("invalid ATTRIBUTE_LIST record length".into());
+        }
+
+        let lowest_vcn = u64::from_le_bytes(
+            remaining[8..16]
+                .try_into()
+                .map_err(|_| "truncated ATTRIBUTE_LIST lowest VCN")?,
+        );
+        let segment_raw = u64::from_le_bytes(
+            remaining[16..24]
+                .try_into()
+                .map_err(|_| "truncated ATTRIBUTE_LIST segment reference")?,
+        );
+        let segment_reference = segment_raw & 0x0000_FFFF_FFFF_FFFF;
+        let segment_sequence = (segment_raw >> 48) as u16;
+        let attribute_id = u16::from_le_bytes([remaining[24], remaining[25]]);
+
+        let name = if name_length == 0 {
+            None
+        } else {
+            let name_bytes = name_length
+                .checked_mul(2)
+                .ok_or("ATTRIBUTE_LIST name length overflow")?;
+            let name_end = name_offset
+                .checked_add(name_bytes)
+                .ok_or("ATTRIBUTE_LIST name offset overflow")?;
+            if name_offset < ATTRIBUTE_LIST_ENTRY_HEADER_SIZE || name_end > record_length {
+                return Err("ATTRIBUTE_LIST name extends beyond entry".into());
+            }
+            let utf16 = remaining[name_offset..name_end]
+                .chunks_exact(2)
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .collect::<Vec<_>>();
+            Some(
+                String::from_utf16(&utf16)
+                    .map_err(|_| "ATTRIBUTE_LIST name is not valid UTF-16")?,
+            )
+        };
+
+        entries.push(AttributeListEntry {
+            attr_type,
+            name,
+            lowest_vcn,
+            segment_reference,
+            segment_sequence,
+            attribute_id,
+        });
+        offset = offset
+            .checked_add(record_length)
+            .ok_or("ATTRIBUTE_LIST offset overflow")?;
+    }
+
+    Ok(entries)
 }
 
 impl TryFrom<u32> for AttributeType {
@@ -690,6 +1057,55 @@ impl StandardInformation {
 }
 
 // ----- FileNameAttr -----
+/// Namespace byte stored in `$FILE_NAME` and directory index keys.
+///
+/// NTFS may store both a Win32 long name and a DOS 8.3 alias for the same
+/// parent link. Keeping this value is essential: attribute order is not a
+/// reliable indication of which name should be presented to investigators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FileNameNamespace {
+    Posix,
+    Win32,
+    Dos,
+    Win32AndDos,
+    Unknown(u8),
+}
+
+impl FileNameNamespace {
+    pub fn from_raw(value: u8) -> Self {
+        match value {
+            0 => Self::Posix,
+            1 => Self::Win32,
+            2 => Self::Dos,
+            3 => Self::Win32AndDos,
+            other => Self::Unknown(other),
+        }
+    }
+
+    pub fn as_raw(self) -> u8 {
+        match self {
+            Self::Posix => 0,
+            Self::Win32 => 1,
+            Self::Dos => 2,
+            Self::Win32AndDos => 3,
+            Self::Unknown(value) => value,
+        }
+    }
+
+    pub fn is_dos_only(self) -> bool {
+        self == Self::Dos
+    }
+
+    fn preference(self) -> u8 {
+        match self {
+            Self::Win32 | Self::Win32AndDos => 3,
+            Self::Posix => 2,
+            Self::Dos => 1,
+            Self::Unknown(_) => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileNameAttr {
     pub parent_ref: u64,
@@ -697,6 +1113,7 @@ pub struct FileNameAttr {
     pub allocated_size: u64,
     pub real_size: u64,
     pub name: String,
+    pub namespace: FileNameNamespace,
     pub flags: u32,
     pub created: u64,      // FILETIME
     pub modified: u64,     // FILETIME
@@ -724,7 +1141,7 @@ impl FileNameAttr {
         let flags = cur.read_u32::<LittleEndian>().ok()?;
         cur.read_u32::<LittleEndian>().ok()?; // reparse value
         let name_len = cur.read_u8().ok()? as usize;
-        cur.read_u8().ok()?; // namespace
+        let namespace = FileNameNamespace::from_raw(cur.read_u8().ok()?);
 
         let name_off = 66;
         if raw.len() < name_off + name_len * 2 {
@@ -745,6 +1162,7 @@ impl FileNameAttr {
             allocated_size,
             real_size,
             name,
+            namespace,
             flags,
             created,
             modified,
@@ -756,6 +1174,7 @@ impl FileNameAttr {
     fn to_json(&self) -> Value {
         json!({
             "name": self.name,
+            "namespace": self.namespace,
             "parent": self.parent_ref,
             "allocated": self.allocated_size,
             "size": self.real_size,
@@ -849,8 +1268,12 @@ fn si_flags_to_string(flags: u32) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectoryEntry {
     pub file_id: u64,
+    pub file_sequence: u16,
     pub name: String,
     pub flags: u8,
+    pub parent_ref: u64,
+    pub parent_seq: u16,
+    pub namespace: FileNameNamespace,
 }
 
 impl DirectoryEntry {
@@ -866,7 +1289,11 @@ impl DirectoryEntry {
         cur.read_u8().ok()?;
         cur.read_u16::<LittleEndian>().ok()?;
         let key_start = 0x10;
-        if slice.len() < key_start + key_len {
+        if entry_len < key_start
+            || entry_len > slice.len()
+            || key_len == 0
+            || key_len > entry_len - key_start
+        {
             return None;
         }
         let key_slice = &slice[key_start..key_start + key_len];
@@ -874,8 +1301,12 @@ impl DirectoryEntry {
         Some((
             DirectoryEntry {
                 file_id: file_ref & 0x0000_FFFF_FFFF_FFFF,
+                file_sequence: (file_ref >> 48) as u16,
                 name: fname.name,
                 flags,
+                parent_ref: fname.parent_ref,
+                parent_seq: fname.parent_seq,
+                namespace: fname.namespace,
             },
             entry_len,
         ))
@@ -905,29 +1336,308 @@ pub fn parse_index_root(raw: &[u8]) -> Option<Vec<DirectoryEntry>> {
     // INDEX_HEADER (0x10)
     let entries_offset = cur.read_u32::<LittleEndian>().ok()? as usize;
     let total_size = cur.read_u32::<LittleEndian>().ok()? as usize;
-    cur.read_u32::<LittleEndian>().ok()?; // allocated size (unused)
+    let allocated_size = cur.read_u32::<LittleEndian>().ok()? as usize;
     let _flags = cur.read_u8().ok()?;
     cur.seek(SeekFrom::Current(3)).ok()?;
 
-    let start = index_header_base + entries_offset;
-    let end = start + total_size;
+    parse_index_entries(
+        raw,
+        index_header_base,
+        entries_offset,
+        total_size,
+        allocated_size,
+    )
+    .ok()
+}
+
+/// Apply INDX fixups and parse the entries of one index-allocation block.
+/// Any USA mismatch rejects the entire block.
+pub(crate) fn parse_index_record(
+    raw: &[u8],
+    sector_size: usize,
+) -> Result<Vec<DirectoryEntry>, String> {
+    if raw.len() < 0x28 || &raw[..4] != b"INDX" {
+        return Err("invalid INDX record signature or length".into());
+    }
+    let mut fixed = raw.to_vec();
+    let usa_offset = usize::from(u16::from_le_bytes([fixed[4], fixed[5]]));
+    let usa_count = usize::from(u16::from_le_bytes([fixed[6], fixed[7]]));
+    apply_fixups_with_sector_size(&mut fixed, usa_offset, usa_count, sector_size)?;
+
+    let index_header_base = 0x18usize;
+    let entries_offset = u32::from_le_bytes(
+        fixed[0x18..0x1C]
+            .try_into()
+            .map_err(|_| "truncated INDX entries offset")?,
+    ) as usize;
+    let total_size = u32::from_le_bytes(
+        fixed[0x1C..0x20]
+            .try_into()
+            .map_err(|_| "truncated INDX total size")?,
+    ) as usize;
+    let allocated_size = u32::from_le_bytes(
+        fixed[0x20..0x24]
+            .try_into()
+            .map_err(|_| "truncated INDX allocated size")?,
+    ) as usize;
+    parse_index_entries(
+        &fixed,
+        index_header_base,
+        entries_offset,
+        total_size,
+        allocated_size,
+    )
+}
+
+fn parse_index_entries(
+    raw: &[u8],
+    index_header_base: usize,
+    entries_offset: usize,
+    total_size: usize,
+    allocated_size: usize,
+) -> Result<Vec<DirectoryEntry>, String> {
+    if entries_offset < 0x10 || total_size < entries_offset || allocated_size < total_size {
+        return Err("invalid INDEX_HEADER sizes".into());
+    }
+    let start = index_header_base
+        .checked_add(entries_offset)
+        .ok_or("index entries offset overflow")?;
+    let end = index_header_base
+        .checked_add(total_size)
+        .ok_or("index entries end overflow")?;
+    let allocation_end = index_header_base
+        .checked_add(allocated_size)
+        .ok_or("index allocation end overflow")?;
+    if start > end || end > allocation_end || allocation_end > raw.len() {
+        return Err("INDEX_HEADER extends outside index allocation".into());
+    }
 
     let mut off = start;
     let mut out = Vec::new();
+    let mut terminal_seen = false;
 
-    while off + 0x10 <= end && off + 0x10 <= raw.len() {
-        let slice = &raw[off..];
+    while off.checked_add(0x10).is_some_and(|minimum| minimum <= end) {
+        let slice = &raw[off..end];
+        let entry_len = usize::from(u16::from_le_bytes([slice[8], slice[9]]));
+        let key_len = usize::from(u16::from_le_bytes([slice[10], slice[11]]));
+        let entry_flags = u16::from_le_bytes([slice[12], slice[13]]);
+        if entry_len < 0x10 || entry_len > slice.len() {
+            return Err("invalid index-entry length".into());
+        }
+        if key_len == 0 {
+            if entry_flags & 0x02 != 0 {
+                terminal_seen = true;
+                break;
+            }
+            return Err("non-terminal index entry has an empty key".into());
+        }
         if let Some((entry, consumed)) = DirectoryEntry::from_slice(slice) {
             if entry.name != "." && entry.name != ".." {
-                out.push(entry.clone());
+                out.push(entry);
             }
-            if entry.flags & 0x02 != 0 {
+            if entry_flags & 0x02 != 0 {
+                terminal_seen = true;
                 break;
             } // last entry
-            off += consumed;
+            off = off
+                .checked_add(consumed)
+                .ok_or("index-entry offset overflow")?;
         } else {
-            break;
+            return Err("malformed index-entry key".into());
         }
     }
-    Some(out)
+    if !terminal_seen {
+        return Err("index allocation has no terminal entry".into());
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header() -> FileRecordHeader {
+        FileRecordHeader {
+            signature: *b"FILE",
+            usa_offset: 0x30,
+            usa_count: 3,
+            lsn: 0,
+            sequence_number: 7,
+            hard_link_count: 1,
+            attrs_offset: 0x38,
+            flags: 1,
+            bytes_in_use: 1024,
+            bytes_allocated: 1024,
+            base_file_record: 0,
+            next_attr_id: 3,
+        }
+    }
+
+    fn file_name_value(name: &str, namespace: u8, parent: u64, parent_seq: u16) -> Vec<u8> {
+        let encoded = name.encode_utf16().collect::<Vec<_>>();
+        let mut value = vec![0u8; 66 + encoded.len() * 2];
+        let parent_ref = parent | (u64::from(parent_seq) << 48);
+        value[0..8].copy_from_slice(&parent_ref.to_le_bytes());
+        value[64] = encoded.len() as u8;
+        value[65] = namespace;
+        for (index, unit) in encoded.into_iter().enumerate() {
+            value[66 + index * 2..68 + index * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        value
+    }
+
+    fn file_name_attribute(id: u16, name: &str, namespace: u8) -> Attribute {
+        let value = file_name_value(name, namespace, 42, 9);
+        Attribute::Resident {
+            header: AttributeHeaderCommon {
+                attr_type: AttributeType::FileName,
+                length: (24 + value.len()) as u32,
+                non_resident: false,
+                name_length: 0,
+                name_offset: 0,
+                flags: 0,
+                id,
+                name: None,
+            },
+            resident: ResidentHeader {
+                value_length: value.len() as u32,
+                value_offset: 24,
+                resident_flags: 1,
+            },
+            value,
+        }
+    }
+
+    #[test]
+    fn preferred_name_uses_namespace_not_attribute_order() {
+        let record = MFTRecord {
+            id: 100,
+            header: header(),
+            attributes: vec![
+                file_name_attribute(1, "DOCUME~1", 2),
+                file_name_attribute(2, "Documents", 1),
+            ],
+            extension_record_ids: Vec::new(),
+        };
+
+        let names = record.file_names();
+        assert_eq!(names[0].namespace, FileNameNamespace::Dos);
+        assert_eq!(names[1].namespace, FileNameNamespace::Win32);
+        assert_eq!(record.primary_name().as_deref(), Some("Documents"));
+        assert_eq!(record.parent_file_id(), Some(42));
+    }
+
+    #[test]
+    fn directory_entry_retains_both_file_references_and_namespace() {
+        let key = file_name_value("Documents", 3, 115_693, 2);
+        let entry_len = 0x10 + key.len();
+        let mut raw = vec![0u8; entry_len];
+        let file_ref = 284_399u64 | (11u64 << 48);
+        raw[0..8].copy_from_slice(&file_ref.to_le_bytes());
+        raw[8..10].copy_from_slice(&(entry_len as u16).to_le_bytes());
+        raw[10..12].copy_from_slice(&(key.len() as u16).to_le_bytes());
+        raw[0x10..].copy_from_slice(&key);
+
+        let (entry, consumed) = DirectoryEntry::from_slice(&raw).expect("valid entry");
+        assert_eq!(consumed, entry_len);
+        assert_eq!(entry.file_id, 284_399);
+        assert_eq!(entry.file_sequence, 11);
+        assert_eq!(entry.parent_ref, 115_693);
+        assert_eq!(entry.parent_seq, 2);
+        assert_eq!(entry.namespace, FileNameNamespace::Win32AndDos);
+    }
+
+    #[test]
+    fn attribute_list_parser_validates_fixed_tuple_and_bounds() {
+        let mut raw = vec![0u8; 40];
+        raw[0..4].copy_from_slice(&(AttributeType::IndexRoot as u32).to_le_bytes());
+        raw[4..6].copy_from_slice(&40u16.to_le_bytes());
+        raw[6] = 4;
+        raw[7] = 0x1A;
+        raw[8..16].copy_from_slice(&3u64.to_le_bytes());
+        let segment = 320_246u64 | (3u64 << 48);
+        raw[16..24].copy_from_slice(&segment.to_le_bytes());
+        raw[24..26].copy_from_slice(&7u16.to_le_bytes());
+        for (offset, unit) in "$I30".encode_utf16().enumerate() {
+            raw[0x1A + offset * 2..0x1C + offset * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+
+        let entries = parse_attribute_list(&raw, 1).expect("valid ATTRIBUTE_LIST");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].segment_reference, 320_246);
+        assert_eq!(entries[0].segment_sequence, 3);
+        assert_eq!(entries[0].lowest_vcn, 3);
+        assert_eq!(entries[0].attribute_id, 7);
+        assert_eq!(entries[0].name.as_deref(), Some("$I30"));
+
+        raw[4..6].copy_from_slice(&0u16.to_le_bytes());
+        assert!(parse_attribute_list(&raw, 1).is_err());
+    }
+
+    #[test]
+    fn usa_must_protect_the_whole_record_and_match_every_sector() {
+        let mut record = vec![0u8; 1024];
+        record[48..50].copy_from_slice(&[0xAA, 0x55]);
+        record[50..52].copy_from_slice(&[1, 2]);
+        record[52..54].copy_from_slice(&[3, 4]);
+        record[510..512].copy_from_slice(&[0xAA, 0x55]);
+        record[1022..1024].copy_from_slice(&[0xAA, 0x55]);
+        apply_fixups_with_sector_size(&mut record, 48, 3, 512).expect("valid USA");
+        assert_eq!(&record[510..512], &[1, 2]);
+        assert_eq!(&record[1022..1024], &[3, 4]);
+
+        assert!(apply_fixups_with_sector_size(&mut record, 48, 2, 512).is_err());
+        record[1022..1024].copy_from_slice(&[0, 0]);
+        assert!(apply_fixups_with_sector_size(&mut record, 48, 3, 512).is_err());
+    }
+
+    #[test]
+    fn zero_length_attribute_is_rejected_instead_of_looping() {
+        let mut raw = vec![0u8; 0x40];
+        raw[0..4].copy_from_slice(&(AttributeType::Data as u32).to_le_bytes());
+        assert!(parse_attribute(&raw, 0, raw.len(), AttributeType::Data).is_err());
+    }
+
+    #[test]
+    fn index_header_requires_a_bounded_terminal_entry() {
+        let mut raw = vec![0u8; 0x20];
+        raw[0x10 + 8..0x10 + 10].copy_from_slice(&0x10u16.to_le_bytes());
+        raw[0x10 + 12..0x10 + 14].copy_from_slice(&0x02u16.to_le_bytes());
+        assert!(parse_index_entries(&raw, 0, 0x10, 0x20, 0x20).is_ok());
+
+        raw[0x10 + 12..0x10 + 14].fill(0);
+        assert!(parse_index_entries(&raw, 0, 0x10, 0x20, 0x20).is_err());
+        assert!(parse_index_entries(&raw, 0, 0x18, 0x20, 0x18).is_err());
+    }
+
+    #[test]
+    fn display_skips_truncated_standard_information_without_panicking() {
+        let record = MFTRecord {
+            id: 10,
+            header: header(),
+            attributes: vec![Attribute::Resident {
+                header: AttributeHeaderCommon {
+                    attr_type: AttributeType::StandardInformation,
+                    length: 32,
+                    non_resident: false,
+                    name_length: 0,
+                    name_offset: 0,
+                    flags: 0,
+                    id: 1,
+                    name: None,
+                },
+                resident: ResidentHeader {
+                    value_length: 4,
+                    value_offset: 24,
+                    resident_flags: 0,
+                },
+                value: vec![0; 4],
+            }],
+            extension_record_ids: Vec::new(),
+        };
+
+        let rendered = record.to_string();
+        assert!(rendered.contains("StandardInformation"));
+        assert!(!rendered.contains("$STANDARD_INFORMATION"));
+    }
 }

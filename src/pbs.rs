@@ -6,7 +6,7 @@
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use capstone::prelude::*;
-use prettytable::{row, Table};
+use prettytable::{Table, row};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, Cursor, Read};
@@ -155,12 +155,23 @@ impl PartitionBootSector {
 
     /// Get the logical byte address of the MFT
     pub fn mft_address(&self) -> u64 {
-        self.mft_cluster * self.cluster_size() as u64
+        self.checked_mft_address().unwrap_or(u64::MAX)
+    }
+
+    /// Checked logical byte address of the MFT for untrusted boot sectors.
+    pub fn checked_mft_address(&self) -> Option<u64> {
+        self.mft_cluster.checked_mul(self.cluster_size() as u64)
     }
 
     /// Get the logical byte address of the MFT mirror
     pub fn mft_backup(&self) -> u64 {
-        self.mft_mirror_cluster * self.cluster_size() as u64
+        self.checked_mft_backup().unwrap_or(u64::MAX)
+    }
+
+    /// Checked logical byte address of the MFT mirror.
+    pub fn checked_mft_backup(&self) -> Option<u64> {
+        self.mft_mirror_cluster
+            .checked_mul(self.cluster_size() as u64)
     }
 
     pub fn to_json(&self) -> Value {
@@ -222,7 +233,6 @@ impl std::fmt::Display for PartitionBootSector {
 }
 
 impl PartitionBootSector {
-
     pub fn disassemble_bootstrap_code(&self) -> String {
         let cs = Capstone::new()
             .x86()
