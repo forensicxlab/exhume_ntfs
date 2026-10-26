@@ -17,6 +17,24 @@ pub mod mft;
 pub mod pbs;
 pub mod usnjrn;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectoryIssueKind {
+    InvalidIndexRoot,
+    InvalidIndexBlock,
+    TruncatedIndexBlock,
+    IndexBlockReadFailed,
+    InvalidParentReference,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectoryIssue {
+    pub kind: DirectoryIssueKind,
+    pub index_block: Option<u64>,
+    pub child_record: Option<u64>,
+    pub message: String,
+}
+
 const MAX_ATTRIBUTE_LIST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ATTRIBUTE_LIST_ENTRIES: usize = 131_072;
 const MAX_ATTRIBUTE_LIST_RECORDS: usize = 4_096;
@@ -224,7 +242,9 @@ impl<T: Read + Seek> NTFS<T> {
         self.hydrate_attribute_list(raw)
     }
 
-    fn hydrate_attribute_list(
+    /// Resolve a raw record read from this NTFS volume. Directory walkers can
+    /// validate its allocation and sequence before following extension records.
+    pub fn hydrate_attribute_list(
         &mut self,
         mut logical: MFTRecord,
     ) -> Result<MFTRecord, Box<dyn Error>> {
@@ -568,9 +588,36 @@ impl<T: Read + Seek> NTFS<T> {
     /// List every child entry of the directory whose MFT record is "dir_id".
     /// Works for both small (resident) and large (non-resident) directories.
     pub fn list_dir(&mut self, dir_id: u64) -> Result<Vec<DirectoryEntry>, Box<dyn Error>> {
+        self.list_dir_with_diagnostics(dir_id, &mut |issue| {
+            warn!("{}", issue.message);
+            Ok(())
+        })
+    }
+
+    /// Retain validated entries from readable index blocks and report every
+    /// skipped block/key to the caller, independently of logging configuration.
+    pub fn list_dir_with_diagnostics(
+        &mut self,
+        dir_id: u64,
+        diagnostic: &mut dyn FnMut(DirectoryIssue) -> Result<(), Box<dyn Error>>,
+    ) -> Result<Vec<DirectoryEntry>, Box<dyn Error>> {
         let rec = self.get_file_id(dir_id)?;
 
-        let mut entries = rec.directory_entries().unwrap_or_default();
+        let root_entries = rec.directory_entries();
+        if root_entries.is_none()
+            && rec.attributes.iter().any(|attribute| {
+                attribute.header().attr_type == AttributeType::IndexRoot
+                    && attribute.header().name.as_deref() == Some("$I30")
+            })
+        {
+            diagnostic(DirectoryIssue {
+                kind: DirectoryIssueKind::InvalidIndexRoot,
+                index_block: None,
+                child_record: None,
+                message: format!("Invalid $I30 INDEX_ROOT in directory {dir_id}"),
+            })?;
+        }
+        let mut entries = root_entries.unwrap_or_default();
         let index_extents = rec
             .attributes
             .iter()
@@ -647,24 +694,43 @@ impl<T: Read + Seek> NTFS<T> {
                     let logical_offset = index
                         .checked_mul(idx_rec_size as u64)
                         .ok_or("index-record offset overflow")?;
-                    let buf = self.read_nonresident_stream_slice(
+                    let buf = match self.read_nonresident_stream_slice(
                         &index_extents,
                         logical_offset,
                         idx_rec_size,
-                    )?;
+                    ) {
+                        Ok(buf) => buf,
+                        Err(error) => {
+                            diagnostic(DirectoryIssue {
+                                kind: DirectoryIssueKind::IndexBlockReadFailed,
+                                index_block: Some(index),
+                                child_record: None,
+                                message: format!(
+                                    "Cannot read INDX block {index} for directory {dir_id}: {error}"
+                                ),
+                            })?;
+                            continue;
+                        }
+                    };
                     if buf.len() != idx_rec_size {
-                        warn!(
-                            "Skipping truncated INDX block {} for directory {}",
-                            index, dir_id
-                        );
+                        diagnostic(DirectoryIssue {
+                            kind: DirectoryIssueKind::TruncatedIndexBlock,
+                            index_block: Some(index),
+                            child_record: None,
+                            message: format!("Truncated INDX block {index} for directory {dir_id}"),
+                        })?;
                         continue;
                     }
                     match mft::parse_index_record(&buf, bytes_per_sec) {
                         Ok(mut block_entries) => entries.append(&mut block_entries),
-                        Err(error) => warn!(
-                            "Skipping invalid INDX block {} for directory {}: {}",
-                            index, dir_id, error
-                        ),
+                        Err(error) => diagnostic(DirectoryIssue {
+                            kind: DirectoryIssueKind::InvalidIndexBlock,
+                            index_block: Some(index),
+                            child_record: None,
+                            message: format!(
+                                "Invalid INDX block {index} for directory {dir_id}: {error}"
+                            ),
+                        })?,
                     }
                 }
             }
@@ -673,9 +739,27 @@ impl<T: Read + Seek> NTFS<T> {
         // Reject keys whose embedded parent reference does not point at the
         // directory being walked. This prevents a stale B-tree entry from
         // being attached to a reused directory record.
-        entries.retain(|entry| {
-            entry.parent_ref == rec.id && entry.parent_seq == rec.header.sequence_number
-        });
+        let mut validated = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if entry.parent_ref == rec.id && entry.parent_seq == rec.header.sequence_number {
+                validated.push(entry);
+            } else {
+                diagnostic(DirectoryIssue {
+                    kind: DirectoryIssueKind::InvalidParentReference,
+                    index_block: None,
+                    child_record: Some(entry.file_id),
+                    message: format!(
+                        "Invalid parent reference for {:?} in directory {dir_id}: record {} sequence {}, expected {} sequence {}",
+                        entry.name,
+                        entry.parent_ref,
+                        entry.parent_seq,
+                        rec.id,
+                        rec.header.sequence_number
+                    ),
+                })?;
+            }
+        }
+        let mut entries = validated;
 
         canonicalize_directory_entries(&mut entries);
 
